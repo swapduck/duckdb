@@ -1822,45 +1822,50 @@ void JoinHashTable::Reset() {
 	finalized = false;
 }
 
+vector<idx_t> JoinHashTable::GetSortedUnfinishedPartitions() {
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
+	D_ASSERT(current_partitions.Capacity() == num_partitions);
+	D_ASSERT(completed_partitions.Capacity() == num_partitions);
+	D_ASSERT(current_partitions.CheckAllInvalid(num_partitions));
+
+	auto &partitions = sink_collection->GetPartitions();
+	auto min_partition_size = NumericLimits<idx_t>::Maximum();
+
+	vector<idx_t> partition_indices;
+	partition_indices.reserve(num_partitions);
+
+	for (idx_t partition_idx = 0; partition_idx < num_partitions; partition_idx++) {
+		if (completed_partitions.RowIsValidUnsafe(partition_idx)) {
+			continue;
+		}
+		partition_indices.push_back(partition_idx);
+		const auto size =
+		    partitions[partition_idx]->SizeInBytes() + PointerTableSize(partitions[partition_idx]->Count());
+		min_partition_size = MinValue(min_partition_size, size);
+	}
+
+	std::stable_sort(partition_indices.begin(), partition_indices.end(), [&](const idx_t &lhs, const idx_t &rhs) {
+		const auto lhs_size = partitions[lhs]->SizeInBytes() + PointerTableSize(partitions[lhs]->Count());
+		const auto rhs_size = partitions[rhs]->SizeInBytes() + PointerTableSize(partitions[rhs]->Count());
+		return lhs_size / min_partition_size < rhs_size / min_partition_size;
+	});
+
+	return partition_indices;
+}
+
 bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
 	if (finalized) {
 		Reset();
 	}
 
 	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
-	D_ASSERT(current_partitions.Capacity() == num_partitions);
-	D_ASSERT(completed_partitions.Capacity() == num_partitions);
-	D_ASSERT(current_partitions.CheckAllInvalid(num_partitions));
 
 	if (completed_partitions.CheckAllValid(num_partitions)) {
 		return false; // All partitions are done
 	}
 
-	// Create vector with unfinished partition indices
+	auto partition_indices = GetSortedUnfinishedPartitions();
 	auto &partitions = sink_collection->GetPartitions();
-	auto min_partition_size = NumericLimits<idx_t>::Maximum();
-	vector<idx_t> partition_indices;
-	partition_indices.reserve(num_partitions);
-	for (idx_t partition_idx = 0; partition_idx < num_partitions; partition_idx++) {
-		if (completed_partitions.RowIsValidUnsafe(partition_idx)) {
-			continue;
-		}
-		partition_indices.push_back(partition_idx);
-		// Keep track of min partition size
-		const auto size =
-		    partitions[partition_idx]->SizeInBytes() + PointerTableSize(partitions[partition_idx]->Count());
-		min_partition_size = MinValue(min_partition_size, size);
-	}
-
-	// Sort partitions by size, from small to large
-	std::stable_sort(partition_indices.begin(), partition_indices.end(), [&](const idx_t &lhs, const idx_t &rhs) {
-		const auto lhs_size = partitions[lhs]->SizeInBytes() + PointerTableSize(partitions[lhs]->Count());
-		const auto rhs_size = partitions[rhs]->SizeInBytes() + PointerTableSize(partitions[rhs]->Count());
-		// We divide by min_partition_size, effectively rounding everything down to a multiple of min_partition_size
-		// Makes it so minor differences in partition sizes don't mess up the original order
-		// Retaining as much of the original order as possible reduces I/O (partition idx determines eviction queue idx)
-		return lhs_size / min_partition_size < rhs_size / min_partition_size;
-	});
 
 	// Determine which partitions should go next
 	idx_t count = 0;
@@ -1878,6 +1883,90 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
 		current_partitions.SetValidUnsafe(partition_idx);     // Mark as currently active
 		data_collection->Combine(*partitions[partition_idx]); // Move partition to the main data collection
 		completed_partitions.SetValidUnsafe(partition_idx);   // Also already mark as done
+	}
+	D_ASSERT(Count() == count);
+
+	return true;
+}
+
+bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vector<idx_t> &probe_partition_counts,
+                                            const idx_t probe_tuple_width, vector<bool> &partition_swapped) {
+	if (finalized) {
+		Reset();
+	}
+
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
+
+	if (completed_partitions.CheckAllValid(num_partitions)) {
+		return false; // All partitions are done
+	}
+
+
+	auto partition_indices = GetSortedUnfinishedPartitions();
+	auto &partitions = sink_collection->GetPartitions();
+
+	// Calculate total active build size for the skew check
+	idx_t active_build_total_size = 0;
+	idx_t active_build_max_size = 0;
+	for (const auto &p_idx : partition_indices) {
+		idx_t p_size = partitions[p_idx]->SizeInBytes() + PointerTableSize(partitions[p_idx]->Count());
+		active_build_total_size += p_size;
+		active_build_max_size = MaxValue(active_build_max_size, p_size);
+	}
+
+
+	// Determine which partitions should go next
+	idx_t count = 0;
+	idx_t data_size = 0;
+	for (const auto &partition_idx : partition_indices) {
+		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
+
+		const auto p_count = partitions[partition_idx]->Count();
+		const auto p_data_size = partitions[partition_idx]->SizeInBytes();
+		const auto p_build_size = p_data_size + PointerTableSize(p_count);
+
+		const auto incl_count = count + partitions[partition_idx]->Count();
+		const auto incl_data_size = data_size + partitions[partition_idx]->SizeInBytes();
+		const auto incl_ht_size = incl_data_size + PointerTableSize(incl_count);
+
+		if (count > 0 && incl_ht_size > max_ht_size) {
+			break; // Always add at least one partition
+		}
+
+		bool should_swap = false;
+
+		if (!probe_partition_counts.empty()) {
+			const idx_t p_probe_count = probe_partition_counts[partition_idx];
+			const idx_t p_probe_size = (p_probe_count * probe_tuple_width) + PointerTableSize(p_probe_count);
+
+			const auto partition_share =
+			    static_cast<double>(p_build_size) / static_cast<double>(active_build_total_size);
+
+			const bool is_skewed = (p_build_size == active_build_max_size) && (partition_share > 0.33);
+			const bool is_memory_insufficient = p_build_size >= max_ht_size; // max_ht_size is our budget
+			const bool probe_reduces_memory = p_probe_size < p_build_size;
+			const bool probe_fits_memory = p_probe_size <= max_ht_size;
+
+			should_swap = is_skewed && is_memory_insufficient && probe_reduces_memory && probe_fits_memory;
+		}
+
+		current_partitions.SetValidUnsafe(partition_idx);   // Mark as currently active
+		completed_partitions.SetValidUnsafe(partition_idx); // Also already mark as done
+
+		// TODO: Implement correct implementation based on should_swap. false hardcoded to continue with existing
+		// behavior if (should_swap) ... TBD
+		bool _is_swap_exec = false;
+		if (_is_swap_exec) {
+			// Mark it swapped so the external Source pipeline knows to pull from probe_spill
+			partition_swapped[partition_idx] = true;
+			// CRITICAL: Do NOT call Combine() or update count/data_size.
+			// The build partition remains untouched in the sink_collection.
+		} else {
+			// Normal execution: Commit to the Build side
+			count = incl_count;
+			data_size = incl_data_size;
+			data_collection->Combine(*partitions[partition_idx]);
+		}
 	}
 	D_ASSERT(Count() == count);
 
@@ -2000,6 +2089,5 @@ void ProbeSpill::GetPartitionCounts(vector<idx_t> &partition_counts) {
 		partition_counts[partition_idx] = partition->Count();
 	}
 }
-
 
 } // namespace duckdb
