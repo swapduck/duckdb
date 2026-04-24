@@ -410,6 +410,8 @@ public:
 	public:
 		//! Prepare the next probe round
 		void PrepareNextProbe();
+		//! Get per-partition row counts for the currently spilled probe-side data
+		void GetPartitionCounts(vector<idx_t> &partition_counts);
 		//! Scans and consumes the ColumnDataCollection
 		unique_ptr<ColumnDataConsumer> consumer;
 

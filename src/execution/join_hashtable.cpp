@@ -1986,4 +1986,20 @@ void ProbeSpill::PrepareNextProbe() {
 	consumer->InitializeScan();
 }
 
+void ProbeSpill::GetPartitionCounts(vector<idx_t> &partition_counts) {
+	lock_guard<mutex> guard(lock);
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
+	auto &partitions = global_partitions->GetPartitions();
+	partition_counts.assign(num_partitions, 0);
+	const auto partition_count = MinValue<idx_t>(num_partitions, partitions.size());
+	for (idx_t partition_idx = 0; partition_idx < partition_count; partition_idx++) {
+		auto &partition = partitions[partition_idx];
+		if (!partition) {
+			continue;
+		}
+		partition_counts[partition_idx] = partition->Count();
+	}
+}
+
+
 } // namespace duckdb

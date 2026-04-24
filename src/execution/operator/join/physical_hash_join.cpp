@@ -362,6 +362,12 @@ public:
 
 	bool skip_filter_pushdown = false;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
+
+	//! Tracks which partitions have been swapped
+	vector<bool> partition_swapped;
+
+	// Tracks whether the current round has swapped any partitions
+	bool current_round_has_swapped;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -1441,6 +1447,11 @@ public:
 	void PrepareBuild(HashJoinGlobalSinkState &sink);
 	void PrepareProbe(HashJoinGlobalSinkState &sink);
 	void PrepareScanHT(HashJoinGlobalSinkState &sink);
+
+	//! Decide which partitions have been swapped (must hold lock)
+	void DecidePartitionSwaps(HashJoinGlobalSinkState &sink, const vector<idx_t> &build_partition_sizes,
+	                          const vector<idx_t> &build_partition_counts);
+
 	//! Assigns a task to a local source state
 	bool AssignTask(HashJoinGlobalSinkState &sink, HashJoinLocalSourceState &lstate);
 
@@ -1596,6 +1607,116 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 	return false;
 }
 
+void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &sink,
+                                                     const vector<idx_t> &build_partition_sizes,
+                                                     const vector<idx_t> &build_partition_counts) {
+	auto &ht = *sink.hash_table;
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
+
+	// Resize/reset per-round tracking vectors
+	sink.partition_swapped.assign(num_partitions, false);
+	sink.current_round_has_swapped = false;
+
+	// ── Guardrail: MARK and SINGLE joins cannot be safely swapped ──────────
+	//   MARK  – needs the build side to emit a "found match" boolean column.
+	//   SINGLE – requires at-most-one-match semantics that depend on
+	//            the build side being the original RHS.
+	if (op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE) {
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"reason", "skipped: join type does not support swapping"},
+		            {"join_type", EnumUtil::ToString(op.join_type)}});
+		return;
+	}
+
+	// ── Gather probe-side partition sizes ──────────────────────────────────
+	//   probe_spill is only valid after PrepareProbe() has been called at
+	//   least once (i.e., after the first external round's probe phase).
+	//   On the very first call to PrepareBuild() there is no probe_spill yet,
+	//   so we conservatively skip swapping.
+	if (!sink.probe_spill || !sink.probe_spill->consumer) {
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"reason", "skipped: probe_spill not yet available (first round)"}});
+		return;
+	}
+
+	vector<idx_t> probe_partition_counts;
+	sink.probe_spill->GetPartitionCounts(probe_partition_counts);
+
+	if (probe_partition_counts.size() < num_partitions) {
+		probe_partition_counts.resize(num_partitions, 0);
+	}
+
+	// ── Calculate Probe Tuple Width (Thread-Safe Mathematical Estimation) ──
+	bool all_constant;
+	idx_t probe_tuple_width = GetTupleWidth(sink.probe_types, all_constant);
+
+	const auto reservation = sink.temporary_memory_state->GetReservation();
+	D_ASSERT(reservation >= sink.probe_side_requirement);
+	const idx_t build_memory_budget = reservation - sink.probe_side_requirement;
+
+	idx_t active_build_total_size = 0;
+	idx_t active_build_max_size = 0;
+
+	// ── Evaluate each active partition ─────────────────────────────────────
+	const auto &current_partitions_mask = ht.GetCurrentPartitions();
+	for (idx_t p = 0; p < num_partitions; p++) {
+		if (!current_partitions_mask.RowIsValidUnsafe(p)) {
+			// Partition already finished or not active this round
+			continue;
+		}
+
+		const idx_t build_count = build_partition_counts[p];
+		const idx_t build_data_size = build_partition_sizes[p];
+		const idx_t build_size = build_data_size + ht.PointerTableSize(build_count);
+		active_build_total_size += build_size;
+		active_build_max_size = MaxValue(active_build_max_size, build_size);
+
+		const idx_t probe_count = probe_partition_counts[p];
+
+		// ── Mathematically derive the probe size ───────────────────────────
+		// 1. Size of the raw tuple data (Row count * Bytes per row)
+		const idx_t probe_data_size = probe_count * probe_tuple_width;
+		// 2. Add the size of the pointer array we would need to build a Hash Table on this probe side
+		const idx_t probe_size = probe_data_size + ht.PointerTableSize(probe_count);
+
+		const auto partition_share = active_build_total_size == 0 ? 0.0
+		                                                          : static_cast<double>(build_size) /
+		                                                                static_cast<double>(active_build_total_size);
+		const bool is_skewed_partition =
+		    build_size == active_build_max_size && partition_share > SKEW_SINGLE_THREADED_THRESHOLD;
+
+		// TODO: reconsider this heuristic
+		const bool is_memory_insufficient = build_size >= build_memory_budget;
+
+		// TODO: Instead of a simple comparison, check if probe_size < build_size * 0.8
+		// ie. taking the swap overhead to consideration
+		const bool probe_reduces_memory = probe_size < build_size;
+		const bool probe_fits_memory = probe_size <= build_memory_budget;
+
+		const bool should_swap =
+		    is_skewed_partition && is_memory_insufficient && probe_reduces_memory && probe_fits_memory;
+
+		if (should_swap) {
+			sink.partition_swapped[p] = true;
+			sink.current_round_has_swapped = true;
+		}
+
+		DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+		           {{"partition", to_string(p)},
+		            {"build_size_bytes", to_string(build_size)},
+		            {"probe_size_bytes_estimated", to_string(probe_size)}, // Log reflects that this is derived
+		            {"probe_count", to_string(probe_count)},
+		            {"build_partition_share", to_string(partition_share)},
+		            {"is_skewed_partition", is_skewed_partition ? "true" : "false"},
+		            {"is_memory_insufficient", is_memory_insufficient ? "true" : "false"},
+		            {"build_memory_budget_bytes", to_string(build_memory_budget)},
+		            {"decision", should_swap ? "SWAP" : "no_swap"}});
+	}
+
+	DUCKDB_LOG(sink.context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "DecidePartitionSwaps",
+	           {{"any_swap_this_round", sink.current_round_has_swapped ? "true" : "false"}});
+}
+
 void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	D_ASSERT(global_stage != HashJoinSourceStage::BUILD);
 	auto &ht = *sink.hash_table;
@@ -1603,6 +1724,14 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	// Update remaining size
 	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
 	                                                                                    sink.probe_side_requirement);
+
+	// ── Capture build partition sizes and counts before they are consumed ──
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
+	vector<idx_t> build_partition_sizes(num_partitions, 0);
+	vector<idx_t> build_partition_counts(num_partitions, 0);
+	if (sink.external) {
+		ht.GetSinkCollection().GetSizesAndCounts(build_partition_sizes, build_partition_counts);
+	}
 
 	// Try to put the next partitions in the block collection of the HT
 	D_ASSERT(!sink.external || sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
@@ -1612,6 +1741,8 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 		sink.temporary_memory_state->SetZero();
 		return;
 	}
+
+	DecidePartitionSwaps(sink, build_partition_sizes, build_partition_counts);
 
 	auto &data_collection = ht.GetDataCollection();
 	if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty()) {
