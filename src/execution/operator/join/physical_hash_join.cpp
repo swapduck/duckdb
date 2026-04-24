@@ -1720,35 +1720,56 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	D_ASSERT(global_stage != HashJoinSourceStage::BUILD);
 	auto &ht = *sink.hash_table;
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
 
 	// Update remaining size
 	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
 	                                                                                    sink.probe_side_requirement);
 
-	// ── Capture build partition sizes and counts before they are consumed ──
-	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
-	vector<idx_t> build_partition_sizes(num_partitions, 0);
-	vector<idx_t> build_partition_counts(num_partitions, 0);
-	if (sink.external) {
-		ht.GetSinkCollection().GetSizesAndCounts(build_partition_sizes, build_partition_counts);
+	// Guardrail: MARK and SINGLE joins cannot be swapped
+	bool supports_swapping = !(op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE);
+
+	// Gather probe stats if available (Round 2+)
+	vector<idx_t> probe_partition_counts;
+	idx_t probe_tuple_width = 0;
+
+	if (supports_swapping && sink.probe_spill && sink.probe_spill->consumer) {
+		sink.probe_spill->GetPartitionCounts(probe_partition_counts);
+		if (probe_partition_counts.size() < num_partitions) {
+			probe_partition_counts.resize(num_partitions, 0);
+		}
+		bool all_constant;
+		probe_tuple_width = GetTupleWidth(sink.probe_types, all_constant);
 	}
 
-	// Try to put the next partitions in the block collection of the HT
+	sink.partition_swapped.assign(num_partitions, false);
+	const idx_t memory_budget = sink.temporary_memory_state->GetReservation() - sink.probe_side_requirement;
+
 	D_ASSERT(!sink.external || sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
-	if (!sink.external ||
-	    !ht.PrepareExternalFinalize(sink.temporary_memory_state->GetReservation() - sink.probe_side_requirement)) {
-		global_stage = HashJoinSourceStage::DONE;
-		sink.temporary_memory_state->SetZero();
-		return;
-	}
 
-	DecidePartitionSwaps(sink, build_partition_sizes, build_partition_counts);
+	// Calls the overloaded signature. If probe_partition_counts is empty, swapping is automatically skipped.
+    if (!sink.external ||
+        !ht.PrepareExternalFinalize(memory_budget, probe_partition_counts, probe_tuple_width, sink.partition_swapped)) {
+        global_stage = HashJoinSourceStage::DONE;
+        sink.temporary_memory_state->SetZero();
+        return;
+    }
+
+    sink.current_round_has_swapped = false;
+    for (bool swapped : sink.partition_swapped) {
+        if (swapped) {
+            sink.current_round_has_swapped = true;
+            break;
+        }
+    }
 
 	auto &data_collection = ht.GetDataCollection();
-	if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty()) {
-		PrepareBuild(sink);
-		return;
-	}
+	// Edge Case: If data collection is empty, but we DID swap this round, we MUST NOT recursively call PrepareBuild.
+    // We must fall through so the pipeline can instantly transition to PROBE and route the swapped data.
+    if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty() && !sink.current_round_has_swapped) {
+        PrepareBuild(sink);
+        return;
+    }
 
 	build_chunk_idx = 0;
 	build_chunk_count = data_collection.ChunkCount();

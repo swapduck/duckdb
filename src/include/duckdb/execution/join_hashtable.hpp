@@ -347,7 +347,8 @@ private:
 	void GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                    const SelectionVector *sel, idx_t &count, Vector &pointers_result_v, SelectionVector &match_sel,
 	                    bool has_sel);
-
+	//! Helper to extract and sort unfinished partitions
+    vector<idx_t> GetSortedUnfinishedPartitions();
 private:
 	//! Insert the given set of locations into the HT with the given set of hashes_v
 	void InsertHashes(Vector &hashes_v, idx_t count, TupleDataChunkState &chunk_state, InsertState &insert_statebool,
@@ -510,6 +511,11 @@ public:
 	void Reset();
 	//! Build HT for the next partitioned probe round
 	bool PrepareExternalFinalize(const idx_t max_ht_size);
+	//! Build HT for the next partitioned probe round with partition swapping
+	bool PrepareExternalFinalize(const idx_t max_ht_size,
+                             const vector<idx_t> &probe_partition_counts,
+                             const idx_t probe_tuple_width,
+                             vector<bool> &partition_swapped);
 	//! Probe whatever we can, sink the rest into a thread-local HT
 	void ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
 	                   ProbeState &probe_state, DataChunk &probe_chunk, ProbeSpill &probe_spill,
