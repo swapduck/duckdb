@@ -1684,6 +1684,8 @@ void HashJoinGlobalSourceState::DecidePartitionSwaps(HashJoinGlobalSinkState &si
 		                                                                static_cast<double>(active_build_total_size);
 		const bool is_skewed_partition =
 		    build_size == active_build_max_size && partition_share > SKEW_SINGLE_THREADED_THRESHOLD;
+
+		// TODO: reconsider this heuristic
 		const bool is_memory_insufficient = build_size >= build_memory_budget;
 
 		// TODO: Instead of a simple comparison, check if probe_size < build_size * 0.8
