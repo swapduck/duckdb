@@ -409,8 +409,10 @@ public:
 		void Finalize();
 
 	public:
-		//! Prepare the next probe round
-		void PrepareNextProbe();
+		//! Prepare the next probe round (skips swapped partitions if partition_swapped is provided)
+		void PrepareNextProbe(const vector<bool> &partition_swapped = {});
+		//! Extract probe data for swapped partitions into a separate ColumnDataCollection
+		unique_ptr<ColumnDataCollection> ExtractSwappedProbePartitions(const vector<bool> &partition_swapped);
 		//! Get per-partition row counts for the currently spilled probe-side data
 		void GetPartitionCounts(vector<idx_t> &partition_counts);
 		//! Scans and consumes the ColumnDataCollection
@@ -520,6 +522,9 @@ public:
 	void ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
 	                   ProbeState &probe_state, DataChunk &probe_chunk, ProbeSpill &probe_spill,
 	                   ProbeSpillLocalAppendState &spill_state, DataChunk &spill_chunk);
+
+	//! Extract a swapped build partition for the given partition index
+	unique_ptr<TupleDataCollection> ExtractSwappedBuildPartition(idx_t partition_idx);
 
 private:
 	//! The current number of radix bits used to partition

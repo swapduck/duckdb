@@ -366,7 +366,7 @@ public:
 	//! Tracks which partitions have been swapped
 	vector<bool> partition_swapped;
 
-	// Tracks whether the current round has swapped any partitions
+	//! Tracks whether the current round has swapped any partitions
 	bool current_round_has_swapped;
 };
 
@@ -1431,7 +1431,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
-enum class HashJoinSourceStage : uint8_t { INIT, BUILD, PROBE, SCAN_HT, DONE };
+enum class HashJoinSourceStage : uint8_t { INIT, BUILD, PROBE, SCAN_HT, SWAP_BUILD, SWAP_PROBE, DONE };
 
 class HashJoinLocalSourceState;
 
@@ -1447,6 +1447,8 @@ public:
 	void PrepareBuild(HashJoinGlobalSinkState &sink);
 	void PrepareProbe(HashJoinGlobalSinkState &sink);
 	void PrepareScanHT(HashJoinGlobalSinkState &sink);
+	void PrepareSwapBuild(HashJoinGlobalSinkState &sink);
+	void PrepareSwapProbe(HashJoinGlobalSinkState &sink);
 
 	//! Assigns a task to a local source state
 	bool AssignTask(HashJoinGlobalSinkState &sink, HashJoinLocalSourceState &lstate);
@@ -1493,6 +1495,20 @@ public:
 	idx_t full_outer_chunks_per_thread = DConstants::INVALID_INDEX;
 
 	vector<InterruptState> blocked_tasks;
+
+	//! For partition level role reversal
+	unique_ptr<JoinHashTable> swapped_ht;
+	unique_ptr<TupleDataCollection> swapped_build_data; // original build partition, used as probe
+	vector<JoinCondition> swapped_conditions;           // deep-copied and swapped
+	JoinType swapped_join_type;
+	//! Probe data for swapped partitions (extracted before PrepareNextProbe consumes them)
+	unique_ptr<ColumnDataCollection> swapped_probe_collection;
+
+	//! For swap probe synchronization
+	idx_t swap_probe_chunk_idx = DConstants::INVALID_INDEX;
+	idx_t swap_probe_chunk_count;
+	idx_t swap_probe_chunk_done;
+	idx_t swap_probe_chunks_per_thread = DConstants::INVALID_INDEX;
 };
 
 class HashJoinLocalSourceState : public LocalSourceState {
@@ -1507,6 +1523,8 @@ public:
 	void ExternalBuild(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate);
 	void ExternalProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
 	void ExternalScanHT(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
+	void ExternalSwapBuild(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate);
+	void ExternalSwapProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
 
 public:
 	//! The stage that this thread was assigned work for
@@ -1536,6 +1554,19 @@ public:
 	idx_t full_outer_chunk_idx_from = DConstants::INVALID_INDEX;
 	idx_t full_outer_chunk_idx_to = DConstants::INVALID_INDEX;
 	unique_ptr<JoinHTScanState> full_outer_scan_state;
+
+	//! For SWAP_PROBE: assigned chunk range in swapped_build_data
+	idx_t swap_probe_chunk_idx_from = DConstants::INVALID_INDEX;
+	idx_t swap_probe_chunk_idx_to = DConstants::INVALID_INDEX;
+	//! Iterator state for scanning swapped_build_data
+	unique_ptr<JoinHTScanState> swap_probe_scan_state;
+	//! Chunks for holding swap probe data (lazily initialized)
+	DataChunk swap_probe_keys;        // condition cols gathered from swapped_build_data
+	DataChunk swap_probe_data;        // rhs output cols gathered from swapped_build_data
+	DataChunk swap_probe_raw_result;  // [rhs_output | lhs_output] before column reorder
+	TupleDataChunkState swap_probe_key_state;
+	//! Scan structure for probing the swapped HT
+	unique_ptr<JoinHashTable::ScanStructure> swap_scan_structure;
 };
 
 unique_ptr<GlobalSourceState> PhysicalHashJoin::GetGlobalSourceState(ClientContext &context) const {
@@ -1583,7 +1614,9 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 		break;
 	case HashJoinSourceStage::PROBE:
 		if (probe_chunk_done == probe_chunk_count) {
-			if (PropagatesBuildSide(op.join_type)) {
+			if (sink.current_round_has_swapped) {
+				PrepareSwapBuild(sink);
+			} else if (PropagatesBuildSide(op.join_type)) {
 				PrepareScanHT(sink);
 			} else {
 				PrepareBuild(sink);
@@ -1593,6 +1626,26 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 		break;
 	case HashJoinSourceStage::SCAN_HT:
 		if (full_outer_chunk_done == full_outer_chunk_count) {
+			PrepareBuild(sink);
+			return true;
+		}
+		break;
+	case HashJoinSourceStage::SWAP_BUILD:
+		if (build_chunk_done == build_chunk_count) {
+			swapped_ht->GetDataCollection().VerifyEverythingPinned();
+			swapped_ht->finalized = true;
+			PrepareSwapProbe(sink);
+			return true;
+		}
+		break;
+	case HashJoinSourceStage::SWAP_PROBE:
+		if (swap_probe_chunk_done == swap_probe_chunk_count) {
+			// Cleanup swapped state
+			swapped_ht.reset();
+			swapped_build_data.reset();
+			swapped_conditions.clear();
+			swapped_probe_collection.reset();
+			// Continue to next round
 			PrepareBuild(sink);
 			return true;
 		}
@@ -1612,8 +1665,11 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
 	                                                                                    sink.probe_side_requirement);
 
-	// Guardrail: MARK and SINGLE joins cannot be swapped
-	bool supports_swapping = !(op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE);
+	// Restrict swapping to join types where neither the original nor the inverse propagates build side
+	// (i.e., needs SCAN_HT), and where residual predicates don't complicate column remapping.
+	bool supports_swapping = !(op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE) &&
+	                         !PropagatesBuildSide(op.join_type) && HasInverseJoinType(op.join_type) &&
+	                         !PropagatesBuildSide(InverseJoinType(op.join_type)) && !op.residual_info;
 
 	// Gather probe stats if available (Round 2+)
 	vector<idx_t> probe_partition_counts;
@@ -1634,28 +1690,28 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	D_ASSERT(!sink.external || sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
 
 	// Calls the overloaded signature. If probe_partition_counts is empty, swapping is automatically skipped.
-    if (!sink.external ||
-        !ht.PrepareExternalFinalize(memory_budget, probe_partition_counts, probe_tuple_width, sink.partition_swapped)) {
-        global_stage = HashJoinSourceStage::DONE;
-        sink.temporary_memory_state->SetZero();
-        return;
-    }
+	if (!sink.external ||
+	    !ht.PrepareExternalFinalize(memory_budget, probe_partition_counts, probe_tuple_width, sink.partition_swapped)) {
+		global_stage = HashJoinSourceStage::DONE;
+		sink.temporary_memory_state->SetZero();
+		return;
+	}
 
-    sink.current_round_has_swapped = false;
-    for (bool swapped : sink.partition_swapped) {
-        if (swapped) {
-            sink.current_round_has_swapped = true;
-            break;
-        }
-    }
+	sink.current_round_has_swapped = false;
+	for (bool swapped : sink.partition_swapped) {
+		if (swapped) {
+			sink.current_round_has_swapped = true;
+			break;
+		}
+	}
 
 	auto &data_collection = ht.GetDataCollection();
 	// Edge Case: If data collection is empty, but we DID swap this round, we MUST NOT recursively call PrepareBuild.
-    // We must fall through so the pipeline can instantly transition to PROBE and route the swapped data.
-    if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty() && !sink.current_round_has_swapped) {
-        PrepareBuild(sink);
-        return;
-    }
+	// We must fall through so the pipeline can instantly transition to PROBE and route the swapped data.
+	if (data_collection.Count() == 0 && op.EmptyResultIfRHSIsEmpty() && !sink.current_round_has_swapped) {
+		PrepareBuild(sink);
+		return;
+	}
 
 	build_chunk_idx = 0;
 	build_chunk_count = data_collection.ChunkCount();
@@ -1679,7 +1735,14 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 }
 
 void HashJoinGlobalSourceState::PrepareProbe(HashJoinGlobalSinkState &sink) {
-	sink.probe_spill->PrepareNextProbe();
+	// If this round has swapped partitions, extract their probe data BEFORE PrepareNextProbe
+	// consumes (and resets) all current partitions. The swapped probe data will be used in
+	// PrepareSwapBuild to build the reversed hash table.
+	if (sink.current_round_has_swapped && !swapped_probe_collection) {
+		swapped_probe_collection =
+		    sink.probe_spill->ExtractSwappedProbePartitions(sink.partition_swapped);
+	}
+	sink.probe_spill->PrepareNextProbe(sink.partition_swapped);
 	const auto &consumer = *sink.probe_spill->consumer;
 
 	probe_chunk_count = consumer.Count() == 0 ? 0 : consumer.ChunkCount();
@@ -1705,6 +1768,141 @@ void HashJoinGlobalSourceState::PrepareScanHT(HashJoinGlobalSinkState &sink) {
 	    MaxValue<idx_t>((full_outer_chunk_count + sink.num_threads - 1) / sink.num_threads, 1);
 
 	global_stage = HashJoinSourceStage::SCAN_HT;
+}
+
+void HashJoinGlobalSourceState::PrepareSwapBuild(HashJoinGlobalSinkState &sink) {
+	D_ASSERT(global_stage != HashJoinSourceStage::SWAP_BUILD);
+	auto &ht = *sink.hash_table;
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
+
+	// Step 1: Extract original RHS build partition data for all swapped partitions
+	{
+		unique_ptr<TupleDataCollection> combined;
+		for (idx_t i = 0; i < num_partitions; i++) {
+			if (!sink.partition_swapped[i]) {
+				continue;
+			}
+			auto part = ht.ExtractSwappedBuildPartition(i);
+			if (!combined) {
+				combined = std::move(part);
+			} else {
+				combined->Combine(*part);
+			}
+		}
+		swapped_build_data = std::move(combined);
+	}
+
+	if (!swapped_build_data || swapped_build_data->Count() == 0) {
+		// Nothing to swap-probe; go straight back to the next build round
+		swapped_probe_collection.reset();
+		PrepareBuild(sink);
+		return;
+	}
+
+	// Step 2: Deep-copy and invert join conditions for the reversed probe
+	swapped_conditions.clear();
+	for (auto &cond : op.conditions) {
+		auto copy = cond.Copy();
+		copy.Swap();
+		swapped_conditions.push_back(std::move(copy));
+	}
+	swapped_join_type = InverseJoinType(op.join_type);
+
+	// Step 3: Compute output_columns for the swapped HT
+	// Swapped HT layout = [condition_types | lhs_probe_columns | hash]
+	// LHS output positions in that layout = condition_types.size() + lhs_output_in_probe[i]
+	vector<idx_t> swap_output_cols;
+	swap_output_cols.reserve(op.lhs_output_columns.col_idxs.size());
+	for (idx_t i = 0; i < op.lhs_output_columns.col_idxs.size(); i++) {
+		swap_output_cols.push_back(op.condition_types.size() + op.lhs_output_in_probe[i]);
+	}
+
+	// swap_lhs_output_in_probe: identity mapping [0..N-1] because swap_probe_data has exactly rhs_output_columns
+	vector<idx_t> swap_lhs_output_in_probe;
+	swap_lhs_output_in_probe.reserve(op.rhs_output_columns.col_idxs.size());
+	for (idx_t i = 0; i < op.rhs_output_columns.col_idxs.size(); i++) {
+		swap_lhs_output_in_probe.push_back(i);
+	}
+
+	// Step 4: Create the swapped HT (build side = original LHS probe columns)
+	swapped_ht = make_uniq<JoinHashTable>(sink.context, op, swapped_conditions, op.lhs_probe_columns.col_types,
+	                                      swapped_join_type, ht.GetRadixBits(), swap_output_cols,
+	                                      nullptr, // no residual predicate info
+	                                      nullptr, // no residual predicate expression
+	                                      swap_lhs_output_in_probe);
+
+	// Step 5: Sink the swapped probe collection into the swapped HT
+	if (swapped_probe_collection && swapped_probe_collection->Count() > 0) {
+		ExpressionExecutor key_exec(sink.context);
+		for (auto &cond : op.conditions) {
+			key_exec.AddExpression(cond.GetLHS());
+		}
+
+		PartitionedTupleDataAppendState append_state;
+		swapped_ht->GetSinkCollection().InitializeAppendState(append_state);
+
+		DataChunk probe_chunk;
+		DataChunk key_chunk;
+		DataChunk payload_chunk;
+		probe_chunk.Initialize(Allocator::Get(sink.context), sink.probe_types);
+		key_chunk.Initialize(Allocator::Get(sink.context), op.condition_types);
+		payload_chunk.Initialize(Allocator::Get(sink.context), op.lhs_probe_columns.col_types);
+
+		ColumnDataScanState probe_scan;
+		swapped_probe_collection->InitializeScan(probe_scan);
+		while (swapped_probe_collection->Scan(probe_scan, probe_chunk)) {
+			key_chunk.Reset();
+			key_exec.Execute(probe_chunk, key_chunk);
+			payload_chunk.Reset();
+			payload_chunk.ReferenceColumns(probe_chunk, op.lhs_probe_columns.col_idxs);
+			payload_chunk.SetCardinality(probe_chunk.size());
+			swapped_ht->Build(append_state, key_chunk, payload_chunk);
+		}
+		swapped_ht->GetSinkCollection().FlushAppendState(append_state);
+	}
+
+	// Step 6: Unpartition, allocate and initialize the pointer table
+	swapped_ht->Unpartition();
+	swapped_probe_collection.reset(); // free memory early
+
+	swapped_ht->AllocatePointerTable();
+	swapped_ht->InitializePointerTable(0, swapped_ht->capacity);
+
+	// Step 7: Set up SWAP_BUILD stage using the existing build_chunk counters
+	build_chunk_idx = 0;
+	build_chunk_count = swapped_ht->GetDataCollection().ChunkCount();
+	build_chunk_done = 0;
+	build_chunks_per_thread =
+	    MaxValue<idx_t>(MinValue(build_chunk_count, HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
+
+	global_stage = HashJoinSourceStage::SWAP_BUILD;
+
+	// Edge case: swapped HT is empty (e.g., all rows filtered during build)
+	if (build_chunk_count == 0) {
+		swapped_ht->finalized = true;
+		PrepareSwapProbe(sink);
+	}
+}
+
+void HashJoinGlobalSourceState::PrepareSwapProbe(HashJoinGlobalSinkState &sink) {
+	D_ASSERT(global_stage != HashJoinSourceStage::SWAP_PROBE);
+
+	if (!swapped_build_data || swapped_build_data->Count() == 0) {
+		// Nothing to probe; clean up and go to the next build round
+		swapped_ht.reset();
+		swapped_build_data.reset();
+		swapped_conditions.clear();
+		PrepareBuild(sink);
+		return;
+	}
+
+	swap_probe_chunk_idx = 0;
+	swap_probe_chunk_count = swapped_build_data->ChunkCount();
+	swap_probe_chunk_done = 0;
+	swap_probe_chunks_per_thread =
+	    MaxValue<idx_t>(MinValue(swap_probe_chunk_count, (idx_t)HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
+
+	global_stage = HashJoinSourceStage::SWAP_PROBE;
 }
 
 bool HashJoinGlobalSourceState::AssignTask(HashJoinGlobalSinkState &sink, HashJoinLocalSourceState &lstate) {
@@ -1735,6 +1933,26 @@ bool HashJoinGlobalSourceState::AssignTask(HashJoinGlobalSinkState &sink, HashJo
 			full_outer_chunk_idx =
 			    MinValue<idx_t>(full_outer_chunk_count, full_outer_chunk_idx + full_outer_chunks_per_thread);
 			lstate.full_outer_chunk_idx_to = full_outer_chunk_idx;
+			return true;
+		}
+		break;
+	case HashJoinSourceStage::SWAP_BUILD:
+		if (build_chunk_idx != build_chunk_count) {
+			lstate.local_stage = global_stage;
+			lstate.build_chunk_idx_from = build_chunk_idx;
+			build_chunk_idx = MinValue<idx_t>(build_chunk_count, build_chunk_idx + build_chunks_per_thread);
+			lstate.build_chunk_idx_to = build_chunk_idx;
+			return true;
+		}
+		break;
+	case HashJoinSourceStage::SWAP_PROBE:
+		if (swap_probe_chunk_idx != swap_probe_chunk_count) {
+			lstate.local_stage = global_stage;
+			lstate.swap_probe_chunk_idx_from = swap_probe_chunk_idx;
+			swap_probe_chunk_idx =
+			    MinValue<idx_t>(swap_probe_chunk_count, swap_probe_chunk_idx + swap_probe_chunks_per_thread);
+			lstate.swap_probe_chunk_idx_to = swap_probe_chunk_idx;
+			lstate.swap_probe_scan_state.reset();
 			return true;
 		}
 		break;
@@ -1778,6 +1996,12 @@ void HashJoinLocalSourceState::ExecuteTask(HashJoinGlobalSinkState &sink, HashJo
 	case HashJoinSourceStage::SCAN_HT:
 		ExternalScanHT(sink, gstate, chunk);
 		break;
+	case HashJoinSourceStage::SWAP_BUILD:
+		ExternalSwapBuild(sink, gstate);
+		break;
+	case HashJoinSourceStage::SWAP_PROBE:
+		ExternalSwapProbe(sink, gstate, chunk);
+		break;
 	default:
 		throw InternalException("Unexpected HashJoinSourceStage in ExecuteTask!");
 	}
@@ -1792,6 +2016,11 @@ bool HashJoinLocalSourceState::TaskFinished() const {
 		return scan_structure.is_null && !empty_ht_probe_in_progress;
 	case HashJoinSourceStage::SCAN_HT:
 		return full_outer_scan_state == nullptr;
+	case HashJoinSourceStage::SWAP_BUILD:
+		return true;
+	case HashJoinSourceStage::SWAP_PROBE:
+		// Task is done when no chunk range is assigned (INVALID_INDEX sentinel)
+		return swap_probe_chunk_idx_from == DConstants::INVALID_INDEX;
 	default:
 		throw InternalException("Unexpected HashJoinSourceStage in TaskFinished!");
 	}
@@ -1867,6 +2096,146 @@ void HashJoinLocalSourceState::ExternalScanHT(HashJoinGlobalSinkState &sink, Has
 		full_outer_scan_state = nullptr;
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
 		gstate.full_outer_chunk_done += full_outer_chunk_idx_to - full_outer_chunk_idx_from;
+	}
+}
+
+void HashJoinLocalSourceState::ExternalSwapBuild(HashJoinGlobalSinkState &sink,
+                                                  HashJoinGlobalSourceState &gstate) {
+	D_ASSERT(local_stage == HashJoinSourceStage::SWAP_BUILD);
+	D_ASSERT(gstate.swapped_ht);
+
+	gstate.swapped_ht->Finalize(build_chunk_idx_from, build_chunk_idx_to, true);
+
+	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+	gstate.build_chunk_done += build_chunk_idx_to - build_chunk_idx_from;
+}
+
+void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate,
+                                                  DataChunk &chunk) {
+	D_ASSERT(local_stage == HashJoinSourceStage::SWAP_PROBE);
+	D_ASSERT(gstate.swapped_ht && gstate.swapped_ht->finalized);
+	D_ASSERT(gstate.swapped_build_data);
+
+	auto &swapped_ht = *gstate.swapped_ht;
+	auto &swapped_build_data = *gstate.swapped_build_data;
+	const auto &op = gstate.op;
+
+	// Lazily initialize the probe DataChunks on first use
+	if (swap_probe_keys.ColumnCount() == 0) {
+		swap_probe_keys.Initialize(Allocator::Get(sink.context), op.condition_types);
+		swap_probe_data.Initialize(Allocator::Get(sink.context), op.rhs_output_columns.col_types);
+		vector<LogicalType> raw_result_types;
+		for (auto &t : op.rhs_output_columns.col_types) {
+			raw_result_types.push_back(t);
+		}
+		for (auto &t : op.lhs_output_columns.col_types) {
+			raw_result_types.push_back(t);
+		}
+		swap_probe_raw_result.Initialize(Allocator::Get(sink.context), raw_result_types);
+		TupleDataCollection::InitializeChunkState(swap_probe_key_state, op.condition_types);
+	}
+
+	// 1. Continue an active scan structure if there are remaining matches
+	if (swap_scan_structure && !swap_scan_structure->is_null) {
+		swap_probe_raw_result.Reset();
+		swap_scan_structure->Next(swap_probe_keys, swap_probe_data, swap_probe_raw_result);
+		if (swap_probe_raw_result.size() != 0 || !swap_scan_structure->PointersExhausted()) {
+			if (swap_probe_raw_result.size() > 0) {
+				// Reorder columns: raw result is [rhs_output | lhs_output], output must be [lhs_output | rhs_output]
+				const idx_t num_rhs = op.rhs_output_columns.col_types.size();
+				const idx_t num_lhs = op.lhs_output_columns.col_types.size();
+				vector<column_t> reorder(num_lhs + num_rhs);
+				for (idx_t i = 0; i < num_lhs; i++) {
+					reorder[i] = num_rhs + i;
+				}
+				for (idx_t i = 0; i < num_rhs; i++) {
+					reorder[num_lhs + i] = i;
+				}
+				chunk.ReferenceColumns(swap_probe_raw_result, reorder);
+				chunk.SetCardinality(swap_probe_raw_result.size());
+			}
+			return;
+		}
+		// Scan structure exhausted for the current chunk
+		swap_scan_structure->is_null = true;
+	}
+
+	// 2. Advance the iterator to the next chunk, or finish the task if all chunks are done
+	bool has_chunk;
+	if (!swap_probe_scan_state) {
+		// First call for this task: create iterator positioned at swap_probe_chunk_idx_from
+		swap_probe_scan_state =
+		    make_uniq<JoinHTScanState>(swapped_build_data, swap_probe_chunk_idx_from, swap_probe_chunk_idx_to);
+		if (!swap_scan_structure) {
+			swap_scan_structure = make_uniq<JoinHashTable::ScanStructure>(swapped_ht, swap_probe_key_state);
+		}
+		swap_scan_structure->is_null = true;
+		has_chunk = !swap_probe_scan_state->iterator.Done();
+	} else {
+		// Subsequent call: advance to the next chunk in the assigned range
+		has_chunk = swap_probe_scan_state->iterator.Next();
+	}
+
+	if (!has_chunk) {
+		// All assigned chunks have been processed; mark this task as done
+		const idx_t chunks_done = swap_probe_chunk_idx_to - swap_probe_chunk_idx_from;
+		swap_probe_scan_state.reset();
+		swap_probe_chunk_idx_from = DConstants::INVALID_INDEX;
+		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+		gstate.swap_probe_chunk_done += chunks_done;
+		return;
+	}
+
+	// 3. Gather keys and probe data from the current chunk of swapped_build_data, then probe the swapped HT
+	auto &iter = swap_probe_scan_state->iterator;
+	const idx_t row_count = iter.GetCurrentChunkCount();
+	auto *row_locs = iter.GetRowLocations();
+
+	// Load row pointers into a flat POINTER vector for Gather
+	Vector row_locations_vec(LogicalType::POINTER);
+	auto *loc_data = FlatVector::GetDataMutable<data_ptr_t>(row_locations_vec);
+	for (idx_t i = 0; i < row_count; i++) {
+		loc_data[i] = row_locs[i];
+	}
+
+	// Gather condition columns (layout positions 0..n_cond-1) into swap_probe_keys
+	vector<column_t> cond_ids(op.condition_types.size());
+	for (idx_t i = 0; i < op.condition_types.size(); i++) {
+		cond_ids[i] = i;
+	}
+	vector<unique_ptr<Vector>> cast_vec;
+	swap_probe_keys.Reset();
+	swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count, cond_ids,
+	                          swap_probe_keys, *FlatVector::IncrementalSelectionVector(), cast_vec);
+	swap_probe_keys.SetCardinality(row_count);
+
+	// Gather rhs output columns (layout positions from op.rhs_output_columns.col_idxs) into swap_probe_data
+	swap_probe_data.Reset();
+	swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count,
+	                          op.rhs_output_columns.col_idxs, swap_probe_data,
+	                          *FlatVector::IncrementalSelectionVector(), cast_vec);
+	swap_probe_data.SetCardinality(row_count);
+
+	// Probe the swapped HT with the gathered condition keys
+	swap_scan_structure->is_null = false;
+	swapped_ht.Probe(*swap_scan_structure, swap_probe_keys, swap_probe_key_state, probe_state, nullptr);
+
+	// Get the first batch of results
+	swap_probe_raw_result.Reset();
+	swap_scan_structure->Next(swap_probe_keys, swap_probe_data, swap_probe_raw_result);
+	if (swap_probe_raw_result.size() > 0) {
+		// Reorder: [rhs_output | lhs_output] -> [lhs_output | rhs_output]
+		const idx_t num_rhs = op.rhs_output_columns.col_types.size();
+		const idx_t num_lhs = op.lhs_output_columns.col_types.size();
+		vector<column_t> reorder(num_lhs + num_rhs);
+		for (idx_t i = 0; i < num_lhs; i++) {
+			reorder[i] = num_rhs + i;
+		}
+		for (idx_t i = 0; i < num_rhs; i++) {
+			reorder[num_lhs + i] = i;
+		}
+		chunk.ReferenceColumns(swap_probe_raw_result, reorder);
+		chunk.SetCardinality(swap_probe_raw_result.size());
 	}
 }
 

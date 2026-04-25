@@ -1955,8 +1955,7 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vecto
 
 		// TODO: Implement correct implementation based on should_swap. false hardcoded to continue with existing
 		// behavior if (should_swap) ... TBD
-		bool _is_swap_exec = false;
-		if (_is_swap_exec) {
+		if (should_swap) {
 			// Mark it swapped so the external Source pipeline knows to pull from probe_spill
 			partition_swapped[partition_idx] = true;
 			// CRITICAL: Do NOT call Combine() or update count/data_size.
@@ -1971,6 +1970,13 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vecto
 	D_ASSERT(Count() == count);
 
 	return true;
+}
+
+unique_ptr<TupleDataCollection> JoinHashTable::ExtractSwappedBuildPartition(idx_t partition_idx) {
+    auto &partitions = sink_collection->GetPartitions();
+    auto result = make_uniq<TupleDataCollection>(buffer_manager, layout_ptr, MemoryTag::HASH_TABLE);
+    result->Combine(*partitions[partition_idx]);
+    return result;
 }
 
 void JoinHashTable::ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
@@ -2049,7 +2055,7 @@ void ProbeSpill::Finalize() {
 	local_partition_append_states.clear();
 }
 
-void ProbeSpill::PrepareNextProbe() {
+void ProbeSpill::PrepareNextProbe(const vector<bool> &partition_swapped) {
 	global_spill_collection.reset();
 	auto &partitions = global_partitions->GetPartitions();
 	if (partitions.empty() || ht.current_partitions.CheckAllInvalid(partitions.size())) {
@@ -2057,9 +2063,14 @@ void ProbeSpill::PrepareNextProbe() {
 		global_spill_collection =
 		    make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), probe_types);
 	} else {
-		// Move current partitions to the global spill collection
+		// Move current partitions to the global spill collection, skipping swapped ones
 		for (idx_t partition_idx = 0; partition_idx < partitions.size(); partition_idx++) {
 			if (!ht.current_partitions.RowIsValidUnsafe(partition_idx)) {
+				continue;
+			}
+			// Skip swapped partitions - they will be used to BUILD the swapped HT, not probed normally
+			if (!partition_swapped.empty() && partition_idx < partition_swapped.size() &&
+			    partition_swapped[partition_idx]) {
 				continue;
 			}
 			auto &partition = partitions[partition_idx];
@@ -2070,9 +2081,42 @@ void ProbeSpill::PrepareNextProbe() {
 			}
 			partition.reset();
 		}
+		if (!global_spill_collection) {
+			// All partitions were swapped; create an empty collection
+			global_spill_collection =
+			    make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), probe_types);
+		}
 	}
 	consumer = make_uniq<ColumnDataConsumer>(*global_spill_collection, column_ids);
 	consumer->InitializeScan();
+}
+
+unique_ptr<ColumnDataCollection> ProbeSpill::ExtractSwappedProbePartitions(const vector<bool> &partition_swapped) {
+	auto &partitions = global_partitions->GetPartitions();
+	unique_ptr<ColumnDataCollection> result;
+	for (idx_t partition_idx = 0; partition_idx < partitions.size(); partition_idx++) {
+		if (!ht.current_partitions.RowIsValidUnsafe(partition_idx)) {
+			continue;
+		}
+		if (partition_idx >= partition_swapped.size() || !partition_swapped[partition_idx]) {
+			continue;
+		}
+		auto &partition = partitions[partition_idx];
+		if (!partition || partition->Count() == 0) {
+			partition.reset();
+			continue;
+		}
+		if (!result) {
+			result = std::move(partition);
+		} else {
+			result->Combine(*partition);
+		}
+		partition.reset();
+	}
+	if (!result) {
+		result = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), probe_types);
+	}
+	return result;
 }
 
 void ProbeSpill::GetPartitionCounts(vector<idx_t> &partition_counts) {
