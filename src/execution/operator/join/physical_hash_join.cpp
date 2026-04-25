@@ -2141,15 +2141,19 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 				// Reorder columns: raw result is [rhs_output | lhs_output], output must be [lhs_output | rhs_output]
 				const idx_t num_rhs = op.rhs_output_columns.col_types.size();
 				const idx_t num_lhs = op.lhs_output_columns.col_types.size();
-				vector<column_t> reorder(num_lhs + num_rhs);
-				for (idx_t i = 0; i < num_lhs; i++) {
-					reorder[i] = num_rhs + i;
+				if (num_lhs + num_rhs == 0) {
+					chunk.SetCardinality(swap_probe_raw_result.size());
+				} else {
+					vector<column_t> reorder(num_lhs + num_rhs);
+					for (idx_t i = 0; i < num_lhs; i++) {
+						reorder[i] = num_rhs + i;
+					}
+					for (idx_t i = 0; i < num_rhs; i++) {
+						reorder[num_lhs + i] = i;
+					}
+					chunk.ReferenceColumns(swap_probe_raw_result, reorder);
+					chunk.SetCardinality(swap_probe_raw_result.size());
 				}
-				for (idx_t i = 0; i < num_rhs; i++) {
-					reorder[num_lhs + i] = i;
-				}
-				chunk.ReferenceColumns(swap_probe_raw_result, reorder);
-				chunk.SetCardinality(swap_probe_raw_result.size());
 			}
 			return;
 		}
@@ -2200,17 +2204,20 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 	for (idx_t i = 0; i < op.condition_types.size(); i++) {
 		cond_ids[i] = i;
 	}
-	vector<unique_ptr<Vector>> cast_vec;
+	vector<unique_ptr<Vector>> cond_cast_vec(cond_ids.size());
 	swap_probe_keys.Reset();
 	swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count, cond_ids,
-	                          swap_probe_keys, *FlatVector::IncrementalSelectionVector(), cast_vec);
+	                          swap_probe_keys, *FlatVector::IncrementalSelectionVector(), cond_cast_vec);
 	swap_probe_keys.SetCardinality(row_count);
 
 	// Gather rhs output columns (layout positions from op.rhs_output_columns.col_idxs) into swap_probe_data
 	swap_probe_data.Reset();
-	swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count,
-	                          op.rhs_output_columns.col_idxs, swap_probe_data,
-	                          *FlatVector::IncrementalSelectionVector(), cast_vec);
+	if (!op.rhs_output_columns.col_idxs.empty()) {
+		vector<unique_ptr<Vector>> rhs_cast_vec(op.rhs_output_columns.col_idxs.size());
+		swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count,
+		                          op.rhs_output_columns.col_idxs, swap_probe_data,
+		                          *FlatVector::IncrementalSelectionVector(), rhs_cast_vec);
+	}
 	swap_probe_data.SetCardinality(row_count);
 
 	// Probe the swapped HT with the gathered condition keys
@@ -2224,15 +2231,19 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 		// Reorder: [rhs_output | lhs_output] -> [lhs_output | rhs_output]
 		const idx_t num_rhs = op.rhs_output_columns.col_types.size();
 		const idx_t num_lhs = op.lhs_output_columns.col_types.size();
-		vector<column_t> reorder(num_lhs + num_rhs);
-		for (idx_t i = 0; i < num_lhs; i++) {
-			reorder[i] = num_rhs + i;
+		if (num_lhs + num_rhs == 0) {
+			chunk.SetCardinality(swap_probe_raw_result.size());
+		} else {
+			vector<column_t> reorder(num_lhs + num_rhs);
+			for (idx_t i = 0; i < num_lhs; i++) {
+				reorder[i] = num_rhs + i;
+			}
+			for (idx_t i = 0; i < num_rhs; i++) {
+				reorder[num_lhs + i] = i;
+			}
+			chunk.ReferenceColumns(swap_probe_raw_result, reorder);
+			chunk.SetCardinality(swap_probe_raw_result.size());
 		}
-		for (idx_t i = 0; i < num_rhs; i++) {
-			reorder[num_lhs + i] = i;
-		}
-		chunk.ReferenceColumns(swap_probe_raw_result, reorder);
-		chunk.SetCardinality(swap_probe_raw_result.size());
 	}
 }
 
