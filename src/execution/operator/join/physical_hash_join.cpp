@@ -1500,6 +1500,8 @@ public:
 	unique_ptr<JoinHashTable> swapped_ht;
 	unique_ptr<TupleDataCollection> swapped_build_data; // original build partition, used as probe
 	vector<JoinCondition> swapped_conditions;           // deep-copied and swapped
+	//! Must outlive swapped_ht: JoinHashTable stores output_columns by reference
+	vector<idx_t> swapped_output_cols;
 	JoinType swapped_join_type;
 	//! Probe data for swapped partitions (extracted before PrepareNextProbe consumes them)
 	unique_ptr<ColumnDataCollection> swapped_probe_collection;
@@ -1644,6 +1646,7 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 			swapped_ht.reset();
 			swapped_build_data.reset();
 			swapped_conditions.clear();
+			swapped_output_cols.clear();
 			swapped_probe_collection.reset();
 			// Continue to next round
 			PrepareBuild(sink);
@@ -1810,10 +1813,10 @@ void HashJoinGlobalSourceState::PrepareSwapBuild(HashJoinGlobalSinkState &sink) 
 	// Step 3: Compute output_columns for the swapped HT
 	// Swapped HT layout = [condition_types | lhs_probe_columns | hash]
 	// LHS output positions in that layout = condition_types.size() + lhs_output_in_probe[i]
-	vector<idx_t> swap_output_cols;
-	swap_output_cols.reserve(op.lhs_output_columns.col_idxs.size());
+	swapped_output_cols.clear();
+	swapped_output_cols.reserve(op.lhs_output_columns.col_idxs.size());
 	for (idx_t i = 0; i < op.lhs_output_columns.col_idxs.size(); i++) {
-		swap_output_cols.push_back(op.condition_types.size() + op.lhs_output_in_probe[i]);
+		swapped_output_cols.push_back(op.condition_types.size() + op.lhs_output_in_probe[i]);
 	}
 
 	// swap_lhs_output_in_probe: identity mapping [0..N-1] because swap_probe_data has exactly rhs_output_columns
@@ -1825,7 +1828,7 @@ void HashJoinGlobalSourceState::PrepareSwapBuild(HashJoinGlobalSinkState &sink) 
 
 	// Step 4: Create the swapped HT (build side = original LHS probe columns)
 	swapped_ht = make_uniq<JoinHashTable>(sink.context, op, swapped_conditions, op.lhs_probe_columns.col_types,
-	                                      swapped_join_type, ht.GetRadixBits(), swap_output_cols,
+	                                      swapped_join_type, ht.GetRadixBits(), swapped_output_cols,
 	                                      nullptr, // no residual predicate info
 	                                      nullptr, // no residual predicate expression
 	                                      swap_lhs_output_in_probe);
