@@ -367,7 +367,7 @@ public:
 	vector<bool> partition_swapped;
 
 	//! Tracks whether the current round has swapped any partitions
-	bool current_round_has_swapped;
+	bool current_round_has_swapped = false;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -1561,9 +1561,9 @@ public:
 	//! Iterator state for scanning swapped_build_data
 	unique_ptr<JoinHTScanState> swap_probe_scan_state;
 	//! Chunks for holding swap probe data (lazily initialized)
-	DataChunk swap_probe_keys;        // condition cols gathered from swapped_build_data
-	DataChunk swap_probe_data;        // rhs output cols gathered from swapped_build_data
-	DataChunk swap_probe_raw_result;  // [rhs_output | lhs_output] before column reorder
+	DataChunk swap_probe_keys;       // condition cols gathered from swapped_build_data
+	DataChunk swap_probe_data;       // rhs output cols gathered from swapped_build_data
+	DataChunk swap_probe_raw_result; // [rhs_output | lhs_output] before column reorder
 	TupleDataChunkState swap_probe_key_state;
 	//! Scan structure for probing the swapped HT
 	unique_ptr<JoinHashTable::ScanStructure> swap_scan_structure;
@@ -1614,7 +1614,7 @@ bool HashJoinGlobalSourceState::TryPrepareNextStage(HashJoinGlobalSinkState &sin
 		break;
 	case HashJoinSourceStage::PROBE:
 		if (probe_chunk_done == probe_chunk_count) {
-			if (sink.current_round_has_swapped) {
+			if (sink.current_round_has_swapped && !sink.partition_swapped.empty()) {
 				PrepareSwapBuild(sink);
 			} else if (PropagatesBuildSide(op.join_type)) {
 				PrepareScanHT(sink);
@@ -1739,8 +1739,7 @@ void HashJoinGlobalSourceState::PrepareProbe(HashJoinGlobalSinkState &sink) {
 	// consumes (and resets) all current partitions. The swapped probe data will be used in
 	// PrepareSwapBuild to build the reversed hash table.
 	if (sink.current_round_has_swapped && !swapped_probe_collection) {
-		swapped_probe_collection =
-		    sink.probe_spill->ExtractSwappedProbePartitions(sink.partition_swapped);
+		swapped_probe_collection = sink.probe_spill->ExtractSwappedProbePartitions(sink.partition_swapped);
 	}
 	sink.probe_spill->PrepareNextProbe(sink.partition_swapped);
 	const auto &consumer = *sink.probe_spill->consumer;
@@ -1779,7 +1778,7 @@ void HashJoinGlobalSourceState::PrepareSwapBuild(HashJoinGlobalSinkState &sink) 
 	{
 		unique_ptr<TupleDataCollection> combined;
 		for (idx_t i = 0; i < num_partitions; i++) {
-			if (!sink.partition_swapped[i]) {
+			if (i >= sink.partition_swapped.size() || !sink.partition_swapped[i]) {
 				continue;
 			}
 			auto part = ht.ExtractSwappedBuildPartition(i);
@@ -1872,8 +1871,7 @@ void HashJoinGlobalSourceState::PrepareSwapBuild(HashJoinGlobalSinkState &sink) 
 	build_chunk_idx = 0;
 	build_chunk_count = swapped_ht->GetDataCollection().ChunkCount();
 	build_chunk_done = 0;
-	build_chunks_per_thread =
-	    MaxValue<idx_t>(MinValue(build_chunk_count, HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
+	build_chunks_per_thread = MaxValue<idx_t>(MinValue(build_chunk_count, HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
 
 	global_stage = HashJoinSourceStage::SWAP_BUILD;
 
@@ -2099,8 +2097,7 @@ void HashJoinLocalSourceState::ExternalScanHT(HashJoinGlobalSinkState &sink, Has
 	}
 }
 
-void HashJoinLocalSourceState::ExternalSwapBuild(HashJoinGlobalSinkState &sink,
-                                                  HashJoinGlobalSourceState &gstate) {
+void HashJoinLocalSourceState::ExternalSwapBuild(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate) {
 	D_ASSERT(local_stage == HashJoinSourceStage::SWAP_BUILD);
 	D_ASSERT(gstate.swapped_ht);
 
@@ -2111,7 +2108,7 @@ void HashJoinLocalSourceState::ExternalSwapBuild(HashJoinGlobalSinkState &sink,
 }
 
 void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate,
-                                                  DataChunk &chunk) {
+                                                 DataChunk &chunk) {
 	D_ASSERT(local_stage == HashJoinSourceStage::SWAP_PROBE);
 	D_ASSERT(gstate.swapped_ht && gstate.swapped_ht->finalized);
 	D_ASSERT(gstate.swapped_build_data);

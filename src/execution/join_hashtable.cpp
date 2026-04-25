@@ -1953,8 +1953,6 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vecto
 		current_partitions.SetValidUnsafe(partition_idx);   // Mark as currently active
 		completed_partitions.SetValidUnsafe(partition_idx); // Also already mark as done
 
-		// TODO: Implement correct implementation based on should_swap. false hardcoded to continue with existing
-		// behavior if (should_swap) ... TBD
 		if (should_swap) {
 			// Mark it swapped so the external Source pipeline knows to pull from probe_spill
 			partition_swapped[partition_idx] = true;
