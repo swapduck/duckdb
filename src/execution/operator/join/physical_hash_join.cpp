@@ -2131,6 +2131,21 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 		swap_probe_raw_result.Initialize(Allocator::Get(sink.context), raw_result_types);
 		TupleDataCollection::InitializeChunkState(swap_probe_key_state, op.condition_types);
 	}
+	// Keep raw result schema aligned with what the swapped HT will actually produce:
+	// [probe side columns selected by lhs_output_in_probe | build side columns selected by output_columns].
+	const idx_t expected_raw_cols = swapped_ht.lhs_output_in_probe.size() + swapped_ht.output_columns.size();
+	if (swap_probe_raw_result.ColumnCount() != expected_raw_cols) {
+		vector<LogicalType> raw_result_types;
+		raw_result_types.reserve(expected_raw_cols);
+		for (const auto probe_col_idx : swapped_ht.lhs_output_in_probe) {
+			raw_result_types.push_back(swap_probe_data.data[probe_col_idx].GetType());
+		}
+		for (const auto output_col_idx : swapped_ht.output_columns) {
+			raw_result_types.push_back(swapped_ht.layout_ptr->GetTypes()[output_col_idx]);
+		}
+		swap_probe_raw_result.Destroy();
+		swap_probe_raw_result.Initialize(Allocator::Get(sink.context), raw_result_types);
+	}
 
 	// 1. Continue an active scan structure if there are remaining matches
 	if (swap_scan_structure && !swap_scan_structure->is_null) {
@@ -2139,8 +2154,8 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 		if (swap_probe_raw_result.size() != 0 || !swap_scan_structure->PointersExhausted()) {
 			if (swap_probe_raw_result.size() > 0) {
 				// Reorder columns: raw result is [rhs_output | lhs_output], output must be [lhs_output | rhs_output]
-				const idx_t num_rhs = op.rhs_output_columns.col_types.size();
-				const idx_t num_lhs = op.lhs_output_columns.col_types.size();
+				const idx_t num_rhs = swapped_ht.lhs_output_in_probe.size();
+				const idx_t num_lhs = swapped_ht.output_columns.size();
 				if (num_lhs + num_rhs == 0) {
 					chunk.SetCardinality(swap_probe_raw_result.size());
 				} else {
@@ -2220,17 +2235,24 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 	}
 	swap_probe_data.SetCardinality(row_count);
 
+	// Gather precomputed hash values from the tuple layout's final HASH column.
+	// This mirrors the regular external probe path and avoids re-hashing keys.
+	Vector swap_precomputed_hashes(LogicalType::HASH);
+	const auto hash_col_idx = NumericCast<column_t>(swapped_build_data.GetLayout().ColumnCount() - 1);
+	swapped_build_data.Gather(row_locations_vec, *FlatVector::IncrementalSelectionVector(), row_count, hash_col_idx,
+	                          swap_precomputed_hashes, *FlatVector::IncrementalSelectionVector(), nullptr);
+
 	// Probe the swapped HT with the gathered condition keys
 	swap_scan_structure->is_null = false;
-	swapped_ht.Probe(*swap_scan_structure, swap_probe_keys, swap_probe_key_state, probe_state, nullptr);
+	swapped_ht.Probe(*swap_scan_structure, swap_probe_keys, swap_probe_key_state, probe_state, &swap_precomputed_hashes);
 
 	// Get the first batch of results
 	swap_probe_raw_result.Reset();
 	swap_scan_structure->Next(swap_probe_keys, swap_probe_data, swap_probe_raw_result);
 	if (swap_probe_raw_result.size() > 0) {
 		// Reorder: [rhs_output | lhs_output] -> [lhs_output | rhs_output]
-		const idx_t num_rhs = op.rhs_output_columns.col_types.size();
-		const idx_t num_lhs = op.lhs_output_columns.col_types.size();
+		const idx_t num_rhs = swapped_ht.lhs_output_in_probe.size();
+		const idx_t num_lhs = swapped_ht.output_columns.size();
 		if (num_lhs + num_rhs == 0) {
 			chunk.SetCardinality(swap_probe_raw_result.size());
 		} else {
