@@ -1951,6 +1951,7 @@ bool HashJoinGlobalSourceState::AssignTask(HashJoinGlobalSinkState &sink, HashJo
 			    MinValue<idx_t>(swap_probe_chunk_count, swap_probe_chunk_idx + swap_probe_chunks_per_thread);
 			lstate.swap_probe_chunk_idx_to = swap_probe_chunk_idx;
 			lstate.swap_probe_scan_state.reset();
+			lstate.swap_scan_structure.reset();
 			return true;
 		}
 		break;
@@ -2149,6 +2150,8 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 
 	// 1. Continue an active scan structure if there are remaining matches
 	if (swap_scan_structure && !swap_scan_structure->is_null) {
+		D_ASSERT(swap_probe_raw_result.ColumnCount() ==
+		         swapped_ht.lhs_output_in_probe.size() + swapped_ht.output_columns.size());
 		swap_probe_raw_result.Reset();
 		swap_scan_structure->Next(swap_probe_keys, swap_probe_data, swap_probe_raw_result);
 		if (swap_probe_raw_result.size() != 0 || !swap_scan_structure->PointersExhausted()) {
@@ -2182,9 +2185,7 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 		// First call for this task: create iterator positioned at swap_probe_chunk_idx_from
 		swap_probe_scan_state =
 		    make_uniq<JoinHTScanState>(swapped_build_data, swap_probe_chunk_idx_from, swap_probe_chunk_idx_to);
-		if (!swap_scan_structure) {
-			swap_scan_structure = make_uniq<JoinHashTable::ScanStructure>(swapped_ht, swap_probe_key_state);
-		}
+		swap_scan_structure = make_uniq<JoinHashTable::ScanStructure>(swapped_ht, swap_probe_key_state);
 		swap_scan_structure->is_null = true;
 		has_chunk = !swap_probe_scan_state->iterator.Done();
 	} else {
@@ -2247,6 +2248,8 @@ void HashJoinLocalSourceState::ExternalSwapProbe(HashJoinGlobalSinkState &sink, 
 	swapped_ht.Probe(*swap_scan_structure, swap_probe_keys, swap_probe_key_state, probe_state, &swap_precomputed_hashes);
 
 	// Get the first batch of results
+	D_ASSERT(swap_probe_raw_result.ColumnCount() ==
+	         swapped_ht.lhs_output_in_probe.size() + swapped_ht.output_columns.size());
 	swap_probe_raw_result.Reset();
 	swap_scan_structure->Next(swap_probe_keys, swap_probe_data, swap_probe_raw_result);
 	if (swap_probe_raw_result.size() > 0) {
