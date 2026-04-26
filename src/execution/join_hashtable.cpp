@@ -1939,15 +1939,25 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vecto
 			const idx_t p_probe_count = probe_partition_counts[partition_idx];
 			const idx_t p_probe_size = (p_probe_count * probe_tuple_width) + PointerTableSize(p_probe_count);
 
-			const auto partition_share =
-			    static_cast<double>(p_build_size) / static_cast<double>(active_build_total_size);
+			const double build_share = static_cast<double>(p_build_size) / static_cast<double>(active_build_total_size);
 
-			const bool is_skewed = (p_build_size == active_build_max_size) && (partition_share > 0.33);
-			const bool is_memory_insufficient = p_build_size >= max_ht_size; // max_ht_size is our budget
-			const bool probe_reduces_memory = p_probe_size < p_build_size;
+			// check feasibility
 			const bool probe_fits_memory = p_probe_size <= max_ht_size;
 
-			should_swap = is_skewed && is_memory_insufficient && probe_reduces_memory && probe_fits_memory;
+			// check for skew
+			const bool is_dominant_partition = build_share > 0.33;
+
+			const bool is_large_partition = p_build_size >= active_build_max_size * 0.9; // avoids strict equality
+
+			const bool is_skewed = is_dominant_partition || is_large_partition;
+
+			// check for memory pressure
+			const bool memory_pressure = p_build_size > (max_ht_size * 0.9);
+
+			// check for probe cost benefit
+			const bool probe_is_cheaper = p_probe_size < (p_build_size * 0.8);
+
+			should_swap = probe_fits_memory && is_skewed && memory_pressure && probe_is_cheaper;
 		}
 
 		current_partitions.SetValidUnsafe(partition_idx);   // Mark as currently active
@@ -1971,10 +1981,10 @@ bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vecto
 }
 
 unique_ptr<TupleDataCollection> JoinHashTable::ExtractSwappedBuildPartition(idx_t partition_idx) {
-    auto &partitions = sink_collection->GetPartitions();
-    auto result = make_uniq<TupleDataCollection>(buffer_manager, layout_ptr, MemoryTag::HASH_TABLE);
-    result->Combine(*partitions[partition_idx]);
-    return result;
+	auto &partitions = sink_collection->GetPartitions();
+	auto result = make_uniq<TupleDataCollection>(buffer_manager, layout_ptr, MemoryTag::HASH_TABLE);
+	result->Combine(*partitions[partition_idx]);
+	return result;
 }
 
 void JoinHashTable::ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
