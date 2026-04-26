@@ -1822,7 +1822,7 @@ void JoinHashTable::Reset() {
 	finalized = false;
 }
 
-vector<idx_t> JoinHashTable::GetSortedUnfinishedPartitions() {
+vector<idx_t> JoinHashTable::GetSortedUnfinishedPartitions() const {
 	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
 	D_ASSERT(current_partitions.Capacity() == num_partitions);
 	D_ASSERT(completed_partitions.Capacity() == num_partitions);
@@ -1853,130 +1853,134 @@ vector<idx_t> JoinHashTable::GetSortedUnfinishedPartitions() {
 	return partition_indices;
 }
 
-bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
-	if (finalized) {
-		Reset();
-	}
-
+JoinHashTable::ExternalFinalizeRoundPlan
+JoinHashTable::PlanExternalFinalizeRound(const idx_t max_ht_size, const ExternalSwapPolicy &swap_policy,
+                                         optional_ptr<const ExternalProbePartitionStats> probe_stats) const {
+	ExternalFinalizeRoundPlan plan;
 	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
-
 	if (completed_partitions.CheckAllValid(num_partitions)) {
-		return false; // All partitions are done
+		return plan;
 	}
 
 	auto partition_indices = GetSortedUnfinishedPartitions();
 	auto &partitions = sink_collection->GetPartitions();
 
-	// Determine which partitions should go next
-	idx_t count = 0;
-	idx_t data_size = 0;
-	for (const auto &partition_idx : partition_indices) {
-		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
-		const auto incl_count = count + partitions[partition_idx]->Count();
-		const auto incl_data_size = data_size + partitions[partition_idx]->SizeInBytes();
-		const auto incl_ht_size = incl_data_size + PointerTableSize(incl_count);
-		if (count > 0 && incl_ht_size > max_ht_size) {
-			break; // Always add at least one partition
-		}
-		count = incl_count;
-		data_size = incl_data_size;
-		current_partitions.SetValidUnsafe(partition_idx);     // Mark as currently active
-		data_collection->Combine(*partitions[partition_idx]); // Move partition to the main data collection
-		completed_partitions.SetValidUnsafe(partition_idx);   // Also already mark as done
-	}
-	D_ASSERT(Count() == count);
+	vector<ExternalBuildPartitionStats> partition_stats;
+	partition_stats.reserve(partition_indices.size());
 
-	return true;
-}
-
-bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const vector<idx_t> &probe_partition_counts,
-                                            const idx_t probe_tuple_width, vector<bool> &partition_swapped) {
-	if (finalized) {
-		Reset();
-	}
-
-	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
-
-	if (completed_partitions.CheckAllValid(num_partitions)) {
-		return false; // All partitions are done
-	}
-
-
-	auto partition_indices = GetSortedUnfinishedPartitions();
-	auto &partitions = sink_collection->GetPartitions();
-
-	// Calculate total active build size for the skew check
 	idx_t active_build_total_size = 0;
 	idx_t active_build_max_size = 0;
-	for (const auto &p_idx : partition_indices) {
-		idx_t p_size = partitions[p_idx]->SizeInBytes() + PointerTableSize(partitions[p_idx]->Count());
-		active_build_total_size += p_size;
-		active_build_max_size = MaxValue(active_build_max_size, p_size);
-	}
-
-
-	// Determine which partitions should go next
-	idx_t count = 0;
-	idx_t data_size = 0;
 	for (const auto &partition_idx : partition_indices) {
 		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
+		ExternalBuildPartitionStats stats;
+		stats.partition_idx = partition_idx;
+		stats.row_count = partitions[partition_idx]->Count();
+		stats.data_size = partitions[partition_idx]->SizeInBytes();
+		stats.ht_size = stats.data_size + PointerTableSize(stats.row_count);
+		partition_stats.push_back(stats);
+		active_build_total_size += stats.ht_size;
+		active_build_max_size = MaxValue(active_build_max_size, stats.ht_size);
+	}
 
-		const auto p_count = partitions[partition_idx]->Count();
-		const auto p_data_size = partitions[partition_idx]->SizeInBytes();
-		const auto p_build_size = p_data_size + PointerTableSize(p_count);
+	plan.probe_stats_available =
+	    probe_stats && !probe_stats->partition_counts.empty() && probe_stats->tuple_width > 0 && swap_policy.allow_swapping;
 
-		const auto incl_count = count + partitions[partition_idx]->Count();
-		const auto incl_data_size = data_size + partitions[partition_idx]->SizeInBytes();
+	for (const auto &partition : partition_stats) {
+		const auto incl_count = plan.planned_build_count + partition.row_count;
+		const auto incl_data_size = plan.planned_data_size + partition.data_size;
 		const auto incl_ht_size = incl_data_size + PointerTableSize(incl_count);
 
-		if (count > 0 && incl_ht_size > max_ht_size) {
+		if (plan.planned_build_count > 0 && incl_ht_size > max_ht_size) {
 			break; // Always add at least one partition
 		}
 
 		bool should_swap = false;
+		if (plan.probe_stats_available) {
+			D_ASSERT(probe_stats);
+			const auto &probe_partition_counts = probe_stats->partition_counts;
+			const auto p_probe_count =
+			    partition.partition_idx < probe_partition_counts.size() ? probe_partition_counts[partition.partition_idx] : 0;
+			const auto p_probe_size =
+			    (p_probe_count * probe_stats->tuple_width) + PointerTableSize(LossyNumericCast<idx_t>(p_probe_count));
 
-		if (!probe_partition_counts.empty()) {
-			const idx_t p_probe_count = probe_partition_counts[partition_idx];
-			const idx_t p_probe_size = (p_probe_count * probe_tuple_width) + PointerTableSize(p_probe_count);
+			const double build_share = active_build_total_size == 0
+			                               ? 0
+			                               : static_cast<double>(partition.ht_size) / static_cast<double>(active_build_total_size);
 
-			const double build_share = static_cast<double>(p_build_size) / static_cast<double>(active_build_total_size);
-
-			// check feasibility
 			const bool probe_fits_memory = p_probe_size <= max_ht_size;
-
-			// check for skew
 			const bool is_dominant_partition = build_share > 0.33;
-
-			const bool is_large_partition = p_build_size >= active_build_max_size * 0.9; // avoids strict equality
-
+			const bool is_large_partition = partition.ht_size >= active_build_max_size * 0.9; // avoids strict equality
 			const bool is_skewed = is_dominant_partition || is_large_partition;
-
-			// check for memory pressure
-			const bool memory_pressure = p_build_size > (max_ht_size * 0.9);
-
-			// check for probe cost benefit
-			const bool probe_is_cheaper = p_probe_size < (p_build_size * 0.8);
+			const bool memory_pressure = partition.ht_size > (max_ht_size * 0.9);
+			const bool probe_is_cheaper = p_probe_size < (partition.ht_size * 0.8);
 
 			should_swap = probe_fits_memory && is_skewed && memory_pressure && probe_is_cheaper;
 		}
 
-		current_partitions.SetValidUnsafe(partition_idx);   // Mark as currently active
-		completed_partitions.SetValidUnsafe(partition_idx); // Also already mark as done
-
 		if (should_swap) {
-			// Mark it swapped so the external Source pipeline knows to pull from probe_spill
-			partition_swapped[partition_idx] = true;
-			// CRITICAL: Do NOT call Combine() or update count/data_size.
-			// The build partition remains untouched in the sink_collection.
+			plan.swapped_partitions.push_back(partition.partition_idx);
 		} else {
-			// Normal execution: Commit to the Build side
-			count = incl_count;
-			data_size = incl_data_size;
-			data_collection->Combine(*partitions[partition_idx]);
+			plan.build_partitions.push_back(partition.partition_idx);
+			plan.planned_build_count = incl_count;
+			plan.planned_data_size = incl_data_size;
 		}
 	}
-	D_ASSERT(Count() == count);
 
+	plan.planned_ht_size = plan.planned_data_size + PointerTableSize(plan.planned_build_count);
+	plan.memory_fit = plan.planned_ht_size <= max_ht_size;
+	plan.has_work = !plan.build_partitions.empty() || !plan.swapped_partitions.empty();
+	return plan;
+}
+
+void JoinHashTable::ApplyExternalFinalizeRoundPlan(const ExternalFinalizeRoundPlan &plan,
+                                                   optional_ptr<vector<bool>> partition_swapped) {
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
+	if (partition_swapped) {
+		auto &swapped = partition_swapped.get();
+		swapped.assign(num_partitions, false);
+	}
+
+	if (!plan.has_work) {
+		return;
+	}
+
+	auto &partitions = sink_collection->GetPartitions();
+	for (const auto &partition_idx : plan.swapped_partitions) {
+		D_ASSERT(partition_idx < num_partitions);
+		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
+		current_partitions.SetValidUnsafe(partition_idx);
+		completed_partitions.SetValidUnsafe(partition_idx);
+		if (partition_swapped) {
+			partition_swapped.get()[partition_idx] = true;
+		}
+	}
+	for (const auto &partition_idx : plan.build_partitions) {
+		D_ASSERT(partition_idx < num_partitions);
+		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
+		current_partitions.SetValidUnsafe(partition_idx);
+		completed_partitions.SetValidUnsafe(partition_idx);
+		data_collection->Combine(*partitions[partition_idx]);
+	}
+
+	D_ASSERT(Count() == plan.planned_build_count);
+}
+
+bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
+	return PrepareExternalFinalize(max_ht_size, ExternalSwapPolicy {}, nullptr, nullptr);
+}
+
+bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size, const ExternalSwapPolicy &swap_policy,
+                                            optional_ptr<const ExternalProbePartitionStats> probe_stats,
+                                            optional_ptr<vector<bool>> partition_swapped) {
+	if (finalized) {
+		Reset();
+	}
+
+	auto plan = PlanExternalFinalizeRound(max_ht_size, swap_policy, probe_stats);
+	if (!plan.has_work) {
+		return false;
+	}
+	ApplyExternalFinalizeRoundPlan(plan, partition_swapped);
 	return true;
 }
 

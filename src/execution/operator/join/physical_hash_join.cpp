@@ -581,6 +581,14 @@ static bool FinalizeSingleThreaded(const HashJoinGlobalSinkState &sink, const bo
 	return ht_is_small;
 }
 
+static JoinHashTable::ExternalSwapPolicy GetExternalSwapPolicy(const PhysicalHashJoin &op) {
+	JoinHashTable::ExternalSwapPolicy policy;
+	policy.allow_swapping = !(op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE) &&
+	                        !PropagatesBuildSide(op.join_type) && HasInverseJoinType(op.join_type) &&
+	                        !PropagatesBuildSide(InverseJoinType(op.join_type)) && !op.residual_info;
+	return policy;
+}
+
 static idx_t GetTupleWidth(const vector<LogicalType> &types, bool &all_constant) {
 	TupleDataLayout layout;
 	layout.Initialize(types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
@@ -1668,23 +1676,20 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
 	                                                                                    sink.probe_side_requirement);
 
-	// Restrict swapping to join types where neither the original nor the inverse propagates build side
-	// (i.e., needs SCAN_HT), and where residual predicates don't complicate column remapping.
-	bool supports_swapping = !(op.join_type == JoinType::MARK || op.join_type == JoinType::SINGLE) &&
-	                         !PropagatesBuildSide(op.join_type) && HasInverseJoinType(op.join_type) &&
-	                         !PropagatesBuildSide(InverseJoinType(op.join_type)) && !op.residual_info;
+	const auto swap_policy = GetExternalSwapPolicy(op);
 
 	// Gather probe stats if available (Round 2+)
-	vector<idx_t> probe_partition_counts;
-	idx_t probe_tuple_width = 0;
+	JoinHashTable::ExternalProbePartitionStats probe_stats;
+	optional_ptr<const JoinHashTable::ExternalProbePartitionStats> probe_stats_ptr = nullptr;
 
-	if (supports_swapping && sink.probe_spill && sink.probe_spill->consumer) {
-		sink.probe_spill->GetPartitionCounts(probe_partition_counts);
-		if (probe_partition_counts.size() < num_partitions) {
-			probe_partition_counts.resize(num_partitions, 0);
+	if (swap_policy.allow_swapping && sink.probe_spill && sink.probe_spill->consumer) {
+		sink.probe_spill->GetPartitionCounts(probe_stats.partition_counts);
+		if (probe_stats.partition_counts.size() < num_partitions) {
+			probe_stats.partition_counts.resize(num_partitions, 0);
 		}
 		bool all_constant;
-		probe_tuple_width = GetTupleWidth(sink.probe_types, all_constant);
+		probe_stats.tuple_width = GetTupleWidth(sink.probe_types, all_constant);
+		probe_stats_ptr = probe_stats;
 	}
 
 	sink.partition_swapped.assign(num_partitions, false);
@@ -1692,9 +1697,8 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 
 	D_ASSERT(!sink.external || sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
 
-	// Calls the overloaded signature. If probe_partition_counts is empty, swapping is automatically skipped.
 	if (!sink.external ||
-	    !ht.PrepareExternalFinalize(memory_budget, probe_partition_counts, probe_tuple_width, sink.partition_swapped)) {
+	    !ht.PrepareExternalFinalize(memory_budget, swap_policy, probe_stats_ptr, sink.partition_swapped)) {
 		global_stage = HashJoinSourceStage::DONE;
 		sink.temporary_memory_state->SetZero();
 		return;
