@@ -1935,9 +1935,9 @@ JoinHashTable::PlanExternalFinalizeRound(const idx_t max_ht_size, const External
 void JoinHashTable::ApplyExternalFinalizeRoundPlan(const ExternalFinalizeRoundPlan &plan,
                                                    optional_ptr<vector<bool>> partition_swapped) {
 	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
-	if (partition_swapped) {
-		auto &swapped = partition_swapped.get();
-		swapped.assign(num_partitions, false);
+	auto swapped = partition_swapped ? partition_swapped.get() : nullptr;
+	if (swapped) {
+		swapped->assign(num_partitions, false);
 	}
 
 	if (!plan.has_work) {
@@ -1950,8 +1950,8 @@ void JoinHashTable::ApplyExternalFinalizeRoundPlan(const ExternalFinalizeRoundPl
 		D_ASSERT(!completed_partitions.RowIsValidUnsafe(partition_idx));
 		current_partitions.SetValidUnsafe(partition_idx);
 		completed_partitions.SetValidUnsafe(partition_idx);
-		if (partition_swapped) {
-			partition_swapped.get()[partition_idx] = true;
+		if (swapped) {
+			(*swapped)[partition_idx] = true;
 		}
 	}
 	for (const auto &partition_idx : plan.build_partitions) {
