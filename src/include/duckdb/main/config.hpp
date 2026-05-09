@@ -107,6 +107,8 @@ struct DBConfigOptions {
 	bool initialize_default_database = true;
 	//! Enable mbedtls explicitly (overrides OpenSSL if available)
 	bool force_mbedtls = false;
+	//! Adaptive side swapping is disabled
+	bool disable_adaptive_side_swapping = false;
 	//! The set of disabled optimizers (default empty)
 	set<OptimizerType> disabled_optimizers;
 	//! Force a specific schema for VARIANT shredding

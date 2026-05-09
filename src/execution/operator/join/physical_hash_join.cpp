@@ -1676,11 +1676,14 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
 	                                                                                    sink.probe_side_requirement);
 
-	const auto swap_policy = GetExternalSwapPolicy(op);
+	auto swap_policy = GetExternalSwapPolicy(op);
 
 	// Gather probe stats if available (Round 2+)
 	JoinHashTable::ExternalProbePartitionStats probe_stats;
 	optional_ptr<const JoinHashTable::ExternalProbePartitionStats> probe_stats_ptr = nullptr;
+
+	bool swapping_enabled = !DBConfig::GetConfig(sink.context).options.disable_adaptive_side_swapping;
+	swap_policy.allow_swapping = swap_policy.allow_swapping && swapping_enabled;
 
 	if (swap_policy.allow_swapping && sink.probe_spill && sink.probe_spill->consumer) {
 		sink.probe_spill->GetPartitionCounts(probe_stats.partition_counts);

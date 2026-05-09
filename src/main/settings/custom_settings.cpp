@@ -687,6 +687,23 @@ Value DisabledFilesystemsSetting::GetSetting(const ClientContext &context) {
 }
 
 //===----------------------------------------------------------------------===//
+// Adaptive Side Swap
+//===----------------------------------------------------------------------===//
+
+void DisableAdaptiveSideSwappingSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	config.options.disable_adaptive_side_swapping = input.GetValue<bool>();
+}
+
+void DisableAdaptiveSideSwappingSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.disable_adaptive_side_swapping = DBConfigOptions().disable_adaptive_side_swapping;
+}
+
+Value DisableAdaptiveSideSwappingSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	return Value(config.options.disable_adaptive_side_swapping);
+}
+
+//===----------------------------------------------------------------------===//
 // Disabled Optimizers
 //===----------------------------------------------------------------------===//
 void DisabledOptimizersSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
