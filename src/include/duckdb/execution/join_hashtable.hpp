@@ -347,7 +347,8 @@ private:
 	void GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                    const SelectionVector *sel, idx_t &count, Vector &pointers_result_v, SelectionVector &match_sel,
 	                    bool has_sel);
-
+	//! Helper to extract and sort unfinished partitions
+	vector<idx_t> GetSortedUnfinishedPartitions() const;
 private:
 	//! Insert the given set of locations into the HT with the given set of hashes_v
 	void InsertHashes(Vector &hashes_v, idx_t count, TupleDataChunkState &chunk_state, InsertState &insert_statebool,
@@ -408,8 +409,12 @@ public:
 		void Finalize();
 
 	public:
-		//! Prepare the next probe round
-		void PrepareNextProbe();
+		//! Prepare the next probe round (skips swapped partitions if partition_swapped is provided)
+		void PrepareNextProbe(const vector<bool> &partition_swapped = {});
+		//! Extract probe data for swapped partitions into a separate ColumnDataCollection
+		unique_ptr<ColumnDataCollection> ExtractSwappedProbePartitions(const vector<bool> &partition_swapped);
+		//! Get per-partition row counts for the currently spilled probe-side data
+		void GetPartitionCounts(vector<idx_t> &partition_counts);
 		//! Scans and consumes the ColumnDataCollection
 		unique_ptr<ColumnDataConsumer> consumer;
 
@@ -506,12 +511,54 @@ public:
 
 	//! Delete blocks that belong to the current partitioned HT
 	void Reset();
+
+	struct ExternalBuildPartitionStats {
+		idx_t partition_idx;
+		idx_t row_count;
+		idx_t data_size;
+		idx_t ht_size;
+	};
+
+	struct ExternalProbePartitionStats {
+		vector<idx_t> partition_counts;
+		idx_t tuple_width = 0;
+	};
+
+	struct ExternalSwapPolicy {
+		bool allow_swapping = false;
+	};
+
+	struct ExternalFinalizeRoundPlan {
+		vector<idx_t> build_partitions;
+		vector<idx_t> swapped_partitions;
+		idx_t planned_build_count = 0;
+		idx_t planned_data_size = 0;
+		idx_t planned_ht_size = 0;
+		bool memory_fit = true;
+		bool probe_stats_available = false;
+		bool has_work = false;
+	};
+
+	//! Plan the next external finalize round without mutating hash table state
+	ExternalFinalizeRoundPlan PlanExternalFinalizeRound(const idx_t max_ht_size, const ExternalSwapPolicy &swap_policy,
+	                                                    optional_ptr<const ExternalProbePartitionStats> probe_stats =
+	                                                        nullptr) const;
+	//! Apply a precomputed external finalize round plan to hash table state
+	void ApplyExternalFinalizeRoundPlan(const ExternalFinalizeRoundPlan &plan,
+	                                    optional_ptr<vector<bool>> partition_swapped = nullptr);
 	//! Build HT for the next partitioned probe round
 	bool PrepareExternalFinalize(const idx_t max_ht_size);
+	//! Build HT for the next partitioned probe round with partition swapping
+	bool PrepareExternalFinalize(const idx_t max_ht_size, const ExternalSwapPolicy &swap_policy,
+	                             optional_ptr<const ExternalProbePartitionStats> probe_stats = nullptr,
+	                             optional_ptr<vector<bool>> partition_swapped = nullptr);
 	//! Probe whatever we can, sink the rest into a thread-local HT
 	void ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
 	                   ProbeState &probe_state, DataChunk &probe_chunk, ProbeSpill &probe_spill,
 	                   ProbeSpillLocalAppendState &spill_state, DataChunk &spill_chunk);
+
+	//! Extract a swapped build partition for the given partition index
+	unique_ptr<TupleDataCollection> ExtractSwappedBuildPartition(idx_t partition_idx);
 
 private:
 	//! The current number of radix bits used to partition
