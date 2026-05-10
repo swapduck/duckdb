@@ -8,6 +8,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/logging/log_type.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -1918,6 +1919,9 @@ JoinHashTable::PlanExternalFinalizeRound(const idx_t max_ht_size, const External
 		}
 
 		if (should_swap) {
+			DUCKDB_LOG(context, PhysicalOperatorLogType, op, "JoinHashTable", "PlanExternalFinalizeRound",
+			           {{"partition_idx", to_string(partition.partition_idx)},
+						{"ht_size", to_string(partition.ht_size)}});
 			plan.swapped_partitions.push_back(partition.partition_idx);
 		} else {
 			plan.build_partitions.push_back(partition.partition_idx);
