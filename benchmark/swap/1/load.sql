@@ -12,7 +12,7 @@ SELECT
 FROM range(100) t(i)
 UNION ALL
 SELECT
-    i + 10000000 AS join_key,
+     AS join_key,
     hash(i)::UBIGINT AS p1, hash(i+1)::UBIGINT AS p2,
     hash(i+2)::UBIGINT AS p3, hash(i+3)::UBIGINT AS p4,
     hash(i+4)::UBIGINT AS p5, hash(i+5)::UBIGINT AS p6,
