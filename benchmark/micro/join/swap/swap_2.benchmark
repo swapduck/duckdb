@@ -1,0 +1,14 @@
+# name: benchmark/micro/join/swap/swap.benchmark
+# description: Skewed external hash join swap benchmark
+# group: [join]
+
+name skewed_join_swap
+group join
+
+cache swap_skew
+
+retry load 3
+
+load benchmark/micro/join/swap/load.sql
+
+run benchmark/micro/join/swap/q02.sql
