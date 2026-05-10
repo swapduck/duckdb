@@ -1,5 +1,4 @@
 PRAGMA memory_limit='1GB';
-PRAGMA temp_directory='./skew.db';
 
 CREATE TABLE t1 AS
 SELECT

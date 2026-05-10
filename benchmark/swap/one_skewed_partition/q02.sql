@@ -1,5 +1,5 @@
 PRAGMA enable_profiling='json';
-PRAGMA profiling_output='benchmark/swap/2/out/profile_q01.json';
+PRAGMA profiling_output='benchmark/swap/one_skewed_partition/out/profile_q02.json';
 
 PRAGMA custom_profiling_settings='{
     "SYSTEM_PEAK_BUFFER_MEMORY": "true",
@@ -8,8 +8,14 @@ PRAGMA custom_profiling_settings='{
     "TOTAL_BYTES_READ": "true"
 }';
 
-PRAGMA debug_force_external=true;
-PRAGMA disabled_optimizers='join_order';
+-- 1. Single thread
+PRAGMA threads=1;
+
+-- 3. Force join order
+PRAGMA disable_optimizer;
+
+-- 2. 100MB Limit
+PRAGMA memory_limit='100MB';
 
 SELECT COUNT(*)
 FROM t1 p

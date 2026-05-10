@@ -1,6 +1,6 @@
 # name: benchmark/swap/1
 # description: Skewed external hash join swap benchmark
-# group: [1]
+# group: [one_skewed_partition]
 
 name skewed_join_swap
 group join
@@ -9,6 +9,6 @@ cache swap_skew
 
 retry load 3
 
-load benchmark/swap/1/load.sql
+load benchmark/swap/one_skewed_partition/load.sql
 
-run benchmark/swap/1/q01.sql
+run benchmark/swap/one_skewed_partition/q01.sql

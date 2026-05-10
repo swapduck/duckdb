@@ -1,5 +1,4 @@
 PRAGMA memory_limit='1GB';
-PRAGMA temp_directory='./skew.db';
 
 CREATE TABLE t1 AS
 SELECT
@@ -18,7 +17,7 @@ SELECT
     hash(i+4)::UBIGINT AS p5, hash(i+5)::UBIGINT AS p6,
     hash(i+6)::UBIGINT AS p7, hash(i+7)::UBIGINT AS p8,
     hash(i+8)::UBIGINT AS p9
-FROM range(101, 200) t(i);
+FROM range(101, 200) t(i)
 UNION ALL
 SELECT
     3 AS join_key,
