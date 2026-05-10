@@ -1,3 +1,5 @@
+-- 100MB Memory Limit, Single Threaded, Force Join Order
+
 PRAGMA enable_profiling='json';
 PRAGMA profiling_output='benchmark/swap/multiple_skewed_partitions/out/profile_q02.json';
 PRAGMA profiling_mode='detailed';
@@ -9,13 +11,8 @@ PRAGMA custom_profiling_settings='{
     "TOTAL_BYTES_READ": "true"
 }';
 
--- 1. Single thread
 PRAGMA threads=1;
-
--- 3. Force join order
 PRAGMA disable_optimizer;
-
--- 2. 100MB Limit
 PRAGMA memory_limit='100MB';
 
 SELECT COUNT(*)

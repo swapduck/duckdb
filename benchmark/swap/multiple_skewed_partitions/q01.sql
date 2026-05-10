@@ -1,3 +1,5 @@
+-- No memory limit, Single Threaded, Force Join Order
+
 PRAGMA enable_profiling='json';
 PRAGMA profiling_output='benchmark/swap/multiple_skewed_partitions/out/profile_q01.json';
 
