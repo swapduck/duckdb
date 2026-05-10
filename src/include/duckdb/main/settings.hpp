@@ -679,6 +679,16 @@ struct DisabledLogTypes {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct DisableAdaptiveSideSwappingSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "disable_adaptive_side_swapping";
+	static constexpr const char *Description = "DEBUG SETTING: disable adaptive side swapping";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct DisabledOptimizersSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "disabled_optimizers";
