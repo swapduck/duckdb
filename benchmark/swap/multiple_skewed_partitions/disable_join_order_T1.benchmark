@@ -1,4 +1,4 @@
-# name: benchmark/micro/join/swap/multiple_skewed_partitions/swap.benchmark
+# name: benchmark/micro/join/swap/multiple_skewed_partitions
 # description: Skewed external hash join swap benchmark
 # group: [multiple_skewed_partitions]
 
@@ -11,4 +11,4 @@ retry load 3
 
 load benchmark/swap/multiple_skewed_partitions/load.sql
 
-run benchmark/swap/multiple_skewed_partitions/q03.sql
+run benchmark/swap/multiple_skewed_partitions/q01.sql

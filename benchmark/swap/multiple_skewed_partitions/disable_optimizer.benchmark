@@ -11,4 +11,4 @@ retry load 3
 
 load benchmark/swap/multiple_skewed_partitions/load.sql
 
-run benchmark/swap/multiple_skewed_partitions/q03.sql
+run benchmark/swap/multiple_skewed_partitions/q02.sql

@@ -11,4 +11,4 @@ retry load 3
 
 load benchmark/swap/one_skewed_partition_with_smaller_build/load.sql
 
-run benchmark/swap/one_skewed_partition_with_smaller_build/q03.sql
+run benchmark/swap/one_skewed_partition_with_smaller_build/q02.sql
