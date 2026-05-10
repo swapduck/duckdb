@@ -1,3 +1,13 @@
+PRAGMA enable_profiling='json';
+PRAGMA profiling_output='profile_q02.json';
+
+PRAGMA custom_profiling_settings='{
+    "SYSTEM_PEAK_BUFFER_MEMORY": "true",
+    "SYSTEM_PEAK_TEMP_DIR_SIZE": "true",
+    "TOTAL_BYTES_WRITTEN": "true",
+    "TOTAL_BYTES_READ": "true"
+}';
+
 -- 1. Single thread
 PRAGMA threads=1;
 
