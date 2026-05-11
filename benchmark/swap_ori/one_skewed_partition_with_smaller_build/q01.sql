@@ -1,8 +1,7 @@
--- 100MB Memory Limit, Single Threaded, Force Join Order
+-- 100MB Memory Limit, Single Threaded, Force Join Order, Enabled Adaptive Side Swapping
 
 PRAGMA enable_profiling='json';
-PRAGMA profiling_output='benchmark/swap/multiple_skewed_partitions/out/profile_q02.json';
-PRAGMA profiling_mode='detailed';
+PRAGMA profiling_output='benchmark/swap/one_skewed_partition_with_smaller_build/out/profile_q01.json';
 
 PRAGMA custom_profiling_settings='{
     "SYSTEM_PEAK_BUFFER_MEMORY": "true",
@@ -11,9 +10,13 @@ PRAGMA custom_profiling_settings='{
     "TOTAL_BYTES_READ": "true"
 }';
 
+-- 1. Single thread
 PRAGMA threads=1;
-PRAGMA disable_optimizer;
+
+-- 2. 100MB Limit
 PRAGMA memory_limit='100MB';
+PRAGMA disabled_optimizers='join_order';
+
 
 SELECT COUNT(*)
 FROM t1 p
