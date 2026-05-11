@@ -2,7 +2,7 @@
 set -euo pipefail
 
 RUNNER="${1:-build/release/benchmark/benchmark_runner}"
-PATTERN="${2:-benchmark/swap/(skew|zip_alpha)}"
+PATTERN="${2:-benchmark/swap/.*}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
