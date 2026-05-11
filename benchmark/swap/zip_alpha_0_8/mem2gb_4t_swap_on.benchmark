@@ -1,0 +1,5 @@
+template benchmark/swap/swap.benchmark.in
+SCENARIO=zip_alpha_0_8
+MEMORY_LIMIT=2GB
+THREADS=4
+DISABLE_SWAP=false

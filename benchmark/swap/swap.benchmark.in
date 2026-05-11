@@ -1,0 +1,28 @@
+# name: ${FILE_PATH}
+# description: Adaptive side swap: ${SCENARIO} | mem=${MEMORY_LIMIT} | threads=${THREADS} | disable_swap=${DISABLE_SWAP}
+# group: [swap]
+
+name Swap ${SCENARIO} mem=${MEMORY_LIMIT} threads=${THREADS} disable_swap=${DISABLE_SWAP}
+group swap
+subgroup ${SCENARIO}
+
+cache ${SCENARIO}.duckdb
+
+load benchmark/swap/${SCENARIO}/db.sql
+
+init
+SET disabled_optimizers = 'build_side_probe_side,statistics_propagation';
+
+run
+SET memory_limit = '${MEMORY_LIMIT}';
+SET threads = ${THREADS};
+SET disable_adaptive_side_swapping = ${DISABLE_SWAP};
+SELECT
+    ANY_VALUE(o.order_id)   AS sample_order,
+    ANY_VALUE(i.employee_id) AS sample_employee,
+    count(*)                 AS total_matches
+FROM outer_rel o
+JOIN inner_rel  i
+  ON o.join_key = i.join_key
+
+resultmode materialized
