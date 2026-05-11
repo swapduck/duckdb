@@ -22,6 +22,7 @@ cd "$REPO_ROOT"
 "$RUNNER" "$PATTERN" \
     "--out=$TIMINGS" \
     "--log=$PROFILE" \
+    "--disable-timeout" \
     2>"$TABLE"
 
 echo "Done."
