@@ -1,7 +1,7 @@
--- 100MB Memory Limit, Single Threaded, Disa, Enabled Adaptive Side Swapping
+-- 100MB Memory Limit, Single Threaded, Enabled Optimizers, Enabled Adaptive Side Swapping
 
 PRAGMA enable_profiling='json';
-PRAGMA profiling_output='benchmark/swap/one_skewed_partition_with_smaller_build/out/profile_q02.json';
+PRAGMA profiling_output='benchmark/swap/one_skewed_partition_with_smaller_build/out/profile_q03.json';
 
 PRAGMA custom_profiling_settings='{
     "SYSTEM_PEAK_BUFFER_MEMORY": "true",
@@ -15,8 +15,7 @@ PRAGMA threads=1;
 
 -- 2. 100MB Limit
 PRAGMA memory_limit='100MB';
-PRAGMA disable_optimizer;
-
+PRAGMA disabled_optimizers='JOIN_ORDER,BUILD_SIDE_PROBE_SIDE';
 
 
 SELECT COUNT(*)

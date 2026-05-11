@@ -1,0 +1,14 @@
+# name: benchmark/micro/join/swap/multiple_skewed_partitions
+# description: Skewed external hash join swap benchmark
+# group: [multiple_skewed_partitions]
+
+name skewed_join_swap
+group join
+
+cache swap_skew_multiple
+
+retry load 3
+
+load benchmark/swap/multiple_skewed_partitions/load.sql
+
+run benchmark/swap/multiple_skewed_partitions/q05.sql

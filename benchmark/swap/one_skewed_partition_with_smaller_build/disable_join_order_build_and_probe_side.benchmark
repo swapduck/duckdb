@@ -1,0 +1,14 @@
+# name: benchmark/micro/join/swap/one_skewed_partition_with_smaller_build
+# description: Skewed external hash join swap benchmark
+# group: [one_skewed_partition_with_smaller_build]
+
+name skewed_join_swap
+group join
+
+cache swap_skew_multiple_with_smaller_build
+
+retry load 3
+
+load benchmark/swap/one_skewed_partition_with_smaller_build/load.sql
+
+run benchmark/swap/one_skewed_partition_with_smaller_build/q04.sql
