@@ -1,3 +1,16 @@
+# Project Work
+
+Experiments for adaptive side swap mechanism in [https://github.com/swapduck/experiments-x](https://github.com/swapduck/experiments-x)
+and in the `benchmarks/` folder.
+
+The dev branch of this repo contains squashed commits from other working branches, to main a clean git history.
+
+Changes related to the adaptive side swap mechanism can be found in 
+1. `physical_hash_join.cpp`
+2. `join_hashtable.cpp`
+3. `join_hashtable.hpp`
+
+---
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="logo/DuckDB_Logo-horizontal.svg">
